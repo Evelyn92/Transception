@@ -1,0 +1,3 @@
+[10:39:03.757] Namespace(Dataset=datasets.dataset_synapse.Synapse_dataset, accumulation_steps=None, amp_opt_level='O1', base_lr=0.05, batch_size=24, cache_mode='part', dataset='Synapse', deterministic=1, dil_conv=0, eval=False, img_size=224, is_pretrain=True, is_savenii=True, list_dir='/home/students/yiwei/yiwei_gitlab/MISSFormer-bridge/MISSFormer/lists/lists_Synapse', max_epochs=500, max_iterations=30000, num_classes=9, opts=None, output_dir='./model_out', resume=None, seed=1234, tag=None, test_save_dir='../predictions', throughput=False, use_checkpoint=False, volume_path='/images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/test_vol_h5', z_spacing=1, zip=False)
+[10:39:03.757] Transception_v3_epoch_499.pth
+[10:39:03.847] 12 test iterations per epoch
