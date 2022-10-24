@@ -122,7 +122,7 @@ if __name__ == "__main__":
 
 
     # net = Transception(num_classes=args.num_classes, head_count=1, dil_conv = args.dil_conv, token_mlp_mode="mix_skip", inception=args.inception_comb).cuda(0)
-    head_count = args.head_count
+
     net = Transception(num_classes=args.num_classes, head_count=args.head_count, dil_conv = args.dil_conv, token_mlp_mode="mix_skip").cuda()
 
     trainer = {'Synapse': trainer_synapse,}

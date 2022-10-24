@@ -18,7 +18,7 @@ on_exit_hold = (ExitBySignal == True) || (ExitCode != 0)
 # Optional parameters
 ######################################################################
 
-JobBatchName = Transception_testMHA8
+JobBatchName = Transception_testMHA
 nice_user = False
 
 # Choose if job should run on cluster or workstation node. If unset job will run on eachy available node. Options are "cluster" or "workstations"
@@ -88,5 +88,7 @@ notification  = Never
 # --dataset Synapse --base_lr 0.05 --max_epochs 500 --eval_interval 20 --model_name Transception_3branches_head2 --batch_size 24 --root_path /images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/train_npz --dil_conv=1 --output_dir /work/scratch/yiwei/Transception_3branches_mha/head_count2 --head_count=2
 # --dataset Synapse --base_lr 0.05 --max_epochs 500 --eval_interval 20 --model_name Transception_3branches_head4 --batch_size 24 --root_path /images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/train_npz --dil_conv=1 --output_dir /work/scratch/yiwei/Transception_3branches_mha/head_count4 --head_count=4
 queue 1 args from (    
+   --dataset Synapse --base_lr 0.05 --max_epochs 500 --eval_interval 20 --model_name Transception_3branches_head2 --batch_size 24 --root_path /images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/train_npz --dil_conv=1 --output_dir /work/scratch/yiwei/Transception_3branches_mha/head_count2 --head_count=2
+   --dataset Synapse --base_lr 0.05 --max_epochs 500 --eval_interval 20 --model_name Transception_3branches_head4 --batch_size 24 --root_path /images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/train_npz --dil_conv=1 --output_dir /work/scratch/yiwei/Transception_3branches_mha/head_count4 --head_count=4
    --dataset Synapse --base_lr 0.05 --max_epochs 500 --eval_interval 20 --model_name Transception_3branches_head8 --batch_size 24 --root_path /images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/train_npz --dil_conv=1 --output_dir /work/scratch/yiwei/Transception_3branches_mha/head_count8 --head_count=8
 )

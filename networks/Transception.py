@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 # from networks.segformer import *
 # For jupyter notebook below
-from .EffSegformer import *
+from EffSegformer import *
 # from yiwei_gitlab.EffFormer.networks.inception import *
 from typing import Tuple
 from einops import rearrange
@@ -28,11 +28,12 @@ class FuseEfficientAttention(nn.Module):
         Conv2D # of Params:  ((k_h * k_w * C_in) + 1) * C_out)
     """
     
-    def __init__(self, in_channels, key_channels, value_channels, head_count=1):
+    def __init__(self, in_channels, key_channels, value_channels, head_count):
         super().__init__()
         self.in_channels = in_channels
         self.key_channels = key_channels
         self.head_count = head_count
+        # print(f'in fuse attention:{head_count}')
         self.value_channels = value_channels
 
         self.keys = nn.Linear(in_channels, key_channels, bias=True) 
@@ -195,7 +196,7 @@ class EfficientTransformerBlockFuse(nn.Module):
         # self.attn = EfficientAttention(in_channels=in_dim, key_channels=key_dim,
                                     #    value_channels=value_dim, head_count=1)
 
-        self.attn = FuseEfficientAttention(in_channels=in_dim, key_channels=key_dim,value_channels=value_dim, head_count=1)
+        self.attn = FuseEfficientAttention(in_channels=in_dim, key_channels=key_dim,value_channels=value_dim, head_count=head_count)
         self.norm2 = nn.LayerNorm(in_dim)
         if token_mlp=='mix':
             self.mlp1 = MixFFN(in_dim, int(in_dim*4))
@@ -1153,6 +1154,10 @@ class Transception(nn.Module):
             x = x.repeat(1,3,1,1)
 
         output_enc = self.backbone(x)
+        print('output_enc 0: {}'.format(output_enc[0].shape))
+        print('output_enc 1: {}'.format(output_enc[1].shape))
+        print('output_enc 2: {}'.format(output_enc[2].shape))
+        print('output_enc 3: {}'.format(output_enc[3].shape))
 
         b,c,_,_ = output_enc[3].shape
 
@@ -1164,9 +1169,9 @@ class Transception(nn.Module):
 
         return tmp_0
     
-# if __name__ == "__main__":
-#     #call Transception_res
-#     model = Transception(num_classes=9, head_count=1, dil_conv = 1, token_mlp_mode="mix_skip")
+if __name__ == "__main__":
+    #call Transception_res
+    model = Transception(num_classes=9, head_count=8, dil_conv = 1, token_mlp_mode="mix_skip")
 
-#     print(model(torch.rand(1, 3, 224, 224)).shape)
+    print(model(torch.rand(1, 3, 224, 224)).shape)
     
