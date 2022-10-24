@@ -82,7 +82,7 @@ args = parser.parse_args()
 
 if __name__ == "__main__":
    
-    os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+    # os.environ["CUDA_VISIBLE_DEVICES"] = '0'
     if not args.deterministic:
         cudnn.benchmark = True
         cudnn.deterministic = False
@@ -123,7 +123,7 @@ if __name__ == "__main__":
 
     # net = Transception(num_classes=args.num_classes, head_count=1, dil_conv = args.dil_conv, token_mlp_mode="mix_skip", inception=args.inception_comb).cuda(0)
     head_count = args.head_count
-    net = Transception(num_classes=args.num_classes, head_count=head_count, dil_conv = args.dil_conv, token_mlp_mode="mix_skip").cuda(0)
+    net = Transception(num_classes=args.num_classes, head_count=args.head_count, dil_conv = args.dil_conv, token_mlp_mode="mix_skip").cuda()
 
     trainer = {'Synapse': trainer_synapse,}
     trainer[dataset_name](args, net, args.output_dir)

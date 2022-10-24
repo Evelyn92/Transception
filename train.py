@@ -116,7 +116,7 @@ if __name__ == "__main__":
         print('----------not using dil conv-------------')
 
 
-    net = ScaleFormer(args.num_classes).cuda(0)
+    net = ScaleFormer(args.num_classes).cuda()
     
 
 
