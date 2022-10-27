@@ -119,7 +119,8 @@ class EfficientAttention(nn.Module):
         keys = self.keys(input_).reshape((n, self.key_channels, h * w))
         queries = self.queries(input_).reshape(n, self.key_channels, h * w)
         values = self.values(input_).reshape((n, self.value_channels, h * w))
-        
+        #--------
+        # Q K V: [B,Ch,N]
         head_key_channels = self.key_channels // self.head_count
         head_value_channels = self.value_channels // self.head_count
         

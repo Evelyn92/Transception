@@ -75,6 +75,7 @@ parser.add_argument('--dil_conv', type=int,  default=1, help='Set if use dilatio
 parser.add_argument('--inception_comb', type=str,  default="135", help='Set the combination of kernels in the inception module.')
 
 parser.add_argument('--head_count', type=int,  default=1, help='number of head in attention module')
+
 args = parser.parse_args()
 
 # config = get_config(args)
