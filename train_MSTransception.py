@@ -76,6 +76,8 @@ parser.add_argument('--inception_comb', type=str,  default="135", help='Set the 
 
 parser.add_argument('--head_count', type=int,  default=1, help='number of head in attention module')
 parser.add_argument('--MSViT_config', type=int,  default=1, help='Set which config to use')
+parser.add_argument('--concat', type=str,  default="normal", help='normal--2d concat; 3d--3d concat')
+
 args = parser.parse_args()
 
 # config = get_config(args)
@@ -124,7 +126,7 @@ if __name__ == "__main__":
 
     # net = Transception(num_classes=args.num_classes, head_count=1, dil_conv = args.dil_conv, token_mlp_mode="mix_skip", inception=args.inception_comb).cuda(0)
 
-    net = MSTransception(num_classes=args.num_classes, head_count=args.head_count, dil_conv = args.dil_conv, token_mlp_mode="mix_skip", MSViT_config=args.MSViT_config).cuda()
+    net = MSTransception(num_classes=args.num_classes, head_count=args.head_count, dil_conv = args.dil_conv, token_mlp_mode="mix_skip", MSViT_config=args.MSViT_config, concat=args.concat).cuda()
 
     trainer = {'Synapse': trainer_synapse,}
     trainer[dataset_name](args, net, args.output_dir)

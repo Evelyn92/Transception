@@ -218,7 +218,7 @@ class FinalPatchExpand_X4(nn.Module):
         return x
   
 
-class MyDecoderLayer(nn.Module):
+class CCADecoderLayer(nn.Module):
     def __init__(self, input_size, in_out_chan, head_count, token_mlp_mode, n_class=9,
                  norm_layer=nn.LayerNorm, is_last=False):
         super().__init__()
@@ -263,21 +263,22 @@ class MyDecoderLayer(nn.Module):
         if x2 is not None:# skip connection exist
             b, h, w, c = x2.shape
             x2 = x2.view(b, -1, c)
-            cat_x = torch.cat([x1, x2], dim=-1)
-            cat_linear_x = self.concat_linear(cat_x)
+            #TO do: ADD CCA here
+            cat_x = torch.cat([x1, x2], dim=-1)# B,H,W,C+C
+            cat_linear_x = self.concat_linear(cat_x)#B,H,W,2C-> B,H,W,C
             tran_layer_1 = self.layer_former_1(cat_linear_x, h, w)
             tran_layer_2 = self.layer_former_2(tran_layer_1, h, w)
             
             if self.last_layer:
                 out = self.last_layer(self.layer_up(tran_layer_2).view(b, 4*h, 4*w, -1).permute(0,3,1,2)) 
             else:
-                out = self.layer_up(tran_layer_2)
+                out = self.layer_up(tran_layer_2)#B,H,W,C -> B,2H,2W,C
         else:
             # if len(x1.shape)>3:
             #     x1 = x1.permute(0,2,3,1)
             #     b, h, w, c = x1.shape
             #     x1 = x1.view(b, -1, c)
-            out = self.layer_up(x1)
+            out = self.layer_up(x1) # #B,H,W,C-> B,2H,2W,C
         return out
 
 class OverlapPatchEmbeddings(nn.Module):
@@ -394,63 +395,6 @@ class Conv2d_BN(nn.Module):
 
         return x
 
-class Conv3d_BN_concat(nn.Module):
-    # input: attention list of length #path
-    def __init__(
-        self,
-        in_ch,
-        out_ch,
-        kernel_size=1,
-        stride=1,
-        pad=0,
-        dilation=1,
-        groups=1,
-        bn_weight_init=1,
-        act_layer=None,
-        norm_cfg="BN",
-    ):
-        super().__init__()
-        # self.add_module('c', torch.nn.Conv2d(
-        #     a, b, ks, stride, pad, dilation, groups, bias=False))
-        # self.conv = nn.Conv2d(
-        #     in_ch, out_ch, kernel_size, stride, pad, dilation, groups, bias=False
-        # )
-        self.bn = nn.BatchNorm2d(out_ch)
-
-        torch.nn.init.constant_(self.bn.weight, bn_weight_init)
-        torch.nn.init.constant_(self.bn.bias, 0)
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-                # Note that there is no bias due to BN
-                # fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-                # m.weight.data.normal_(mean=0.0, std=sqrt(2.0 / fan_out))
-
-        # self.act_layer = act_layer() if act_layer is not None else nn.Identity()
-        self.interact_concat = nn.Sequential(
-            nn.Conv3d(in_ch, out_ch, kernel_size=(4,1,1)),
-            nn.ReLU()
-        )
-
-    def forward(self, x_list):
-        
-        b,c,h,w = x_list[0].shape
-        out_3d = []
-        for ip in range(len(x_list)):
-            x = x_list[ip]
-            x = x.unsqueeze_(dim=2)
-            out_3d.append(x)
-            # print(f'{ip} path extend to shape{x.shape}')
-
-        x = torch.cat(out_3d, dim=2)
-        # print(f'after concat: {x.shape}')
-        x = torch.squeeze(self.interact_concat(x), dim=2)
-        # print(f'after squeeze: {x.shape}')
-        x = self.bn(x)
-
-        return x
 
 
 class DWCPatchEmbed(nn.Module):
@@ -470,7 +414,7 @@ class DWCPatchEmbed(nn.Module):
         norm_cfg='BN',
     ):
         super().__init__()
-        self.stride = stride
+
         # TODO : confirm whether act_layer is effective or not
         self.patch_conv = DWConv2d_BN(
             in_chans,
@@ -483,7 +427,6 @@ class DWCPatchEmbed(nn.Module):
 
     def forward(self, x):
         x = self.patch_conv(x)
-        # print(f'stride: {self.stride}')
 
         return x
 
@@ -512,7 +455,6 @@ class Patch_Embed_stage(nn.Module):
         att_inputs = []
         for pe in self.patch_embeds:
             x = pe(x)
-            # print(f'patch_embedding:{x.shape}')
             att_inputs.append(x)
 
         return att_inputs
@@ -945,10 +887,9 @@ class MHCA_stage(nn.Module):
         num_path=4,
         norm_cfg="BN",
         drop_path_list=[],
-        concat='normal'
     ):
         super().__init__()
-        self.concat=concat
+
         self.mhca_blks = nn.ModuleList(
             [
                 MHCAEncoder(
@@ -965,24 +906,17 @@ class MHCA_stage(nn.Module):
         self.InvRes = ResBlock(
             in_features=embed_dim, out_features=embed_dim, norm_cfg=norm_cfg
         )
-        if self.concat == 'normal':
-            self.aggregate = Conv2d_BN(
-                embed_dim * (num_path + 1),
-                out_embed_dim,
-                act_layer=nn.Hardswish,
-                norm_cfg=norm_cfg,
-            )
-        else:
-            self.aggregate = Conv3d_BN_concat(
-                embed_dim,
-                out_embed_dim
-            )
+        self.aggregate = Conv2d_BN(
+            embed_dim * (num_path + 1),
+            out_embed_dim,
+            act_layer=nn.Hardswish,
+            norm_cfg=norm_cfg,
+        )
 
     def forward(self, inputs):
         # print(len(inputs))
         # print("---Res---")
         att_outputs = [self.InvRes(inputs[0])]
-        # print(f'Resblock: {self.InvRes(inputs[0]).shape}')
         # 
         for x, encoder in zip(inputs, self.mhca_blks):
             # [B, C, H, W] -> [B, N, C]
@@ -991,19 +925,11 @@ class MHCA_stage(nn.Module):
             x = x.flatten(2).transpose(1, 2).contiguous()
             # print('going to the encoder')
             tmp = encoder(x, size=(H, W))
-            # print(f'\n---attention path{tmp.shape}--')
+            # print('---attention--')
             att_outputs.append(tmp)
 
-        # out_concat = torch.cat(att_outputs, dim=1)
-        # print(f'before cat: {att_outputs[0].shape}')
-        # print(f'before cat: {att_outputs[1].shape}')
-        # print(f'before cat: {att_outputs[2].shape}')
-        if self.concat == 'normal':
-            out = self.aggregate( torch.cat(att_outputs, dim=1))
-        else:
-            out = self.aggregate(att_outputs)
-
-        # print(f'\n after cat: {out.shape}')
+        out_concat = torch.cat(att_outputs, dim=1)
+        out = self.aggregate(out_concat)
 
         return out
 
@@ -1023,7 +949,7 @@ def dpr_generator(drop_path_rate, num_layers, num_stages):
     return dpr
 
 class MSViT(nn.Module):
-    def __init__(self, image_size, in_dim, key_dim, value_dim, layers, head_count=1, dil_conv=1, token_mlp='mix_skip',MSViT_config=1, concat='normal'):
+    def __init__(self, image_size, in_dim, key_dim, value_dim, layers, head_count=1, dil_conv=1, token_mlp='mix_skip',MSViT_config=1):
         super().__init__()
 
         self.Hs=[56, 28, 14, 7]
@@ -1120,7 +1046,6 @@ class MSViT(nn.Module):
                     num_path[0],
                     norm_cfg='BN',
                     drop_path_list=dpr[0],
-                    concat=concat
                 )
 
         self.mhca_stage3 = MHCA_stage(
@@ -1132,7 +1057,6 @@ class MSViT(nn.Module):
                     num_path[1],
                     norm_cfg='BN',
                     drop_path_list=dpr[1],
-                    concat=concat
                 )
 
         self.mhca_stage4 = MHCA_stage(
@@ -1144,7 +1068,6 @@ class MSViT(nn.Module):
                     num_path[2],
                     norm_cfg='BN',
                     drop_path_list=dpr[2],
-                    concat=concat
                 )
 
         # patch_embed
@@ -1392,14 +1315,14 @@ class BridegeBlock_4(nn.Module):
         return outs
 
 
-class MSTransception(nn.Module):
-    def __init__(self, num_classes=9, head_count=1, dil_conv=1, token_mlp_mode="mix_skip", MSViT_config=1, concat='normal'):#, inception="135"
+class MSTransception_dec(nn.Module):
+    def __init__(self, num_classes=9, head_count=1, dil_conv=1, token_mlp_mode="mix_skip", MSViT_config=1):#, inception="135"
         super().__init__()
     
         # Encoder
         dims, key_dim, value_dim, layers = [[64, 128, 320, 512], [64, 128, 320, 512], [64, 128, 320, 512], [2, 2, 2, 2]]        
         self.backbone = MSViT(image_size=224, in_dim=dims, key_dim=key_dim, value_dim=value_dim, layers=layers,
-                            head_count=head_count, dil_conv=dil_conv, token_mlp=token_mlp_mode, MSViT_config=MSViT_config, concat=concat)
+                            head_count=head_count, dil_conv=dil_conv, token_mlp=token_mlp_mode, MSViT_config=MSViT_config)
         # self.backbone = MiT_3inception_padding(image_size=224, in_dim=dims, key_dim=key_dim, value_dim=value_dim, layers=layers,
         #                     head_count=head_count, dil_conv=dil_conv, token_mlp=token_mlp_mode)
 
@@ -1410,13 +1333,13 @@ class MSTransception(nn.Module):
         d_base_feat_size = 7 #16 for 512 input size, and 7 for 224
         in_out_chan = [[32, 64, 64, 64],[144, 128, 128, 128],[288, 320, 320, 320],[512, 512, 512, 512]]  # [dim, out_dim, key_dim, value_dim]
 
-        self.decoder_3 = MyDecoderLayer((d_base_feat_size, d_base_feat_size), in_out_chan[3], head_count, 
+        self.decoder_3 = CCADecoderLayer((d_base_feat_size, d_base_feat_size), in_out_chan[3], head_count, 
                                         token_mlp_mode, n_class=num_classes)
-        self.decoder_2 = MyDecoderLayer((d_base_feat_size*2, d_base_feat_size*2), in_out_chan[2], head_count,
+        self.decoder_2 = CCADecoderLayer((d_base_feat_size*2, d_base_feat_size*2), in_out_chan[2], head_count,
                                         token_mlp_mode, n_class=num_classes)
-        self.decoder_1 = MyDecoderLayer((d_base_feat_size*4, d_base_feat_size*4), in_out_chan[1], head_count, 
+        self.decoder_1 = CCADecoderLayer((d_base_feat_size*4, d_base_feat_size*4), in_out_chan[1], head_count, 
                                         token_mlp_mode, n_class=num_classes) 
-        self.decoder_0 = MyDecoderLayer((d_base_feat_size*8, d_base_feat_size*8), in_out_chan[0], head_count,
+        self.decoder_0 = CCADecoderLayer((d_base_feat_size*8, d_base_feat_size*8), in_out_chan[0], head_count,
                                         token_mlp_mode, n_class=num_classes, is_last=True)
 
         
@@ -1441,7 +1364,7 @@ class MSTransception(nn.Module):
 
 # if __name__ == "__main__":
 #     #call Transception_res
-#     model = MSTransception(num_classes=9, head_count=8, dil_conv = 1, token_mlp_mode="mix_skip",MSViT_config=2, concat='3d')
+#     model = MSTransception(num_classes=9, head_count=8, dil_conv = 1, token_mlp_mode="mix_skip",MSViT_config=2)
 #     tmp_0 = model(torch.rand(1, 3, 224, 224))
 #     # print(len(out_enc))
 #     print(tmp_0.shape)

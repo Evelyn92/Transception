@@ -4,9 +4,9 @@ cmd = /home/students/yiwei/yiwei_gitlab/EffFormer/train.sh
 initialdir = /home/students/yiwei/yiwei_gitlab/EffFormer
 
 # define output, error and log file
-output = /work/scratch/yiwei/MSTr/log1/model_$(cluster).$(Process)_out.log
-error = /work/scratch/yiwei/MSTr/log1/model_$(cluster).$(Process)_err.log
-log = /work/scratch/yiwei/MSTr/log1/model_$(cluster).$(Process)_log.log
+output = /work/scratch/yiwei/play_concat/log/model_$(cluster).$(Process)_out.log
+error = /work/scratch/yiwei/play_concat/log/model_$(cluster).$(Process)_err.log
+log = /work/scratch/yiwei/play_concat/log/model_$(cluster).$(Process)_log.log
 
 # working environments
 getenv        = True
@@ -18,7 +18,7 @@ on_exit_hold = (ExitBySignal == True) || (ExitCode != 0)
 # Optional parameters
 ######################################################################
 
-JobBatchName = MSTr
+JobBatchName = MSTr_3dconcat
 nice_user = False
 
 # Choose if job should run on cluster or workstation node. If unset job will run on eachy available node. Options are "cluster" or "workstations"
@@ -85,7 +85,5 @@ notification  = Never
 # --dataset Synapse --base_lr 0.05 --max_epochs 500 --eval_interval 20 --model_name MSTransception_3Stages --batch_size 24 --root_path /images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/train_npz --dil_conv=1 --output_dir /work/scratch/yiwei/MSTransception/config_4 --head_count 8 --MSViT_config 4
 
 queue 1 args from (    
-   --dataset Synapse --base_lr 0.05 --max_epochs 500 --eval_interval 20 --model_name MSTransception_lr005 --batch_size 24 --root_path /images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/train_npz --dil_conv=1 --output_dir /work/scratch/yiwei/MSTr/lr_0051 --head_count 8 --MSViT_config 2
-   --dataset Synapse --base_lr 0.01 --max_epochs 500 --eval_interval 20 --model_name MSTransception_lr001 --batch_size 24 --root_path /images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/train_npz --dil_conv=1 --output_dir /work/scratch/yiwei/MSTr/lr_0011 --head_count 8 --MSViT_config 2
-   
+   --dataset Synapse --base_lr 0.05 --max_epochs 500 --eval_interval 20 --model_name MSTransception_3dconcat_relu --batch_size 24 --root_path /images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/train_npz --dil_conv=1 --output_dir /work/scratch/yiwei/play_concat/v2 --head_count 8 --MSViT_config 2 --concat 3d
 )
