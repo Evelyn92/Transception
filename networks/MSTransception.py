@@ -1,4 +1,5 @@
 from cmath import sqrt
+from re import X
 import torch
 import torch.nn as nn
 from torch import einsum
@@ -6,6 +7,10 @@ from typing import Tuple
 from einops import rearrange
 from einops.layers.torch import Rearrange
 from torch.nn import functional as F
+from torch.nn import Module, Conv2d, Parameter, Softmax
+from torchvision import models
+from torchinfo import summary
+# from torchstat import stat
 
 from functools import partial
 # from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
@@ -452,6 +457,211 @@ class Conv3d_BN_concat(nn.Module):
 
         return x
 
+class CAM_Module(nn.Module):
+    """ Channel attention module"""
+
+    def __init__(self, in_dim):
+        super().__init__()
+        self.channel_in = in_dim
+
+        self.gamma = Parameter(torch.zeros(1))
+        self.softmax = Softmax(dim=-1)
+        self.numpath = 3
+
+    def forward(self, x):
+        """
+            inputs :
+                x : input feature maps( B  C  numPath H  W)
+            returns :
+                out : attention value + input feature
+                attention: B X C X numPath X numPath
+        """
+        m_batchsize, C,numpath, height, width = x.size()
+        proj_query = x.reshape(m_batchsize, C, numpath, -1) #b c 4 n
+        # print(f'Shape of query: {proj_query.shape}')
+        proj_key = x.reshape(m_batchsize, C,numpath, -1).permute(0, 1, 3, 2) #b c n 4
+        # print(f'Shape of key: {proj_key.shape}') 
+        energy = torch.matmul(proj_query, proj_key) # b c 4 4
+        print(f'Shape of energy: {energy[0][0]}')
+        max_energy_0 = torch.max(energy, -1, keepdim=True)[0].expand_as(energy)
+        energy_new = max_energy_0 - energy# The larger dependency of the channels, the lower energy_new value/ used to emphasizing the different information
+        
+        # min_energy_0 = torch.min(energy, -1, keepdim=True)[0].expand_as(energy)
+        # energy_new = energy - min_energy_0
+        print(f'energy_new: {energy_new[0][0]}')
+        
+        attention = self.softmax(energy_new)
+        print(f'Shape of attention: {attention[0][0]}\n')
+        proj_value = x.reshape(m_batchsize, C, numpath, -1)
+        # print(f'Shape of proj_value: {proj_value.shape}')
+
+        out = torch.matmul(attention, proj_value)# can be replace by torch.matmul
+        out = out.reshape(m_batchsize, C, numpath, height, width)
+
+
+#         logging.debug('cam device: {}, {}'.format(out.device, self.gamma.device))
+        gamma = self.gamma.to(out.device)
+        out = gamma * out + x
+        return out
+
+
+class CAM_Factorized_Module(nn.Module):
+    """ Channel attention module"""
+
+    def __init__(self, in_dim):
+        super().__init__()
+        self.channel_in = in_dim
+        
+        self.gamma = Parameter(torch.zeros(1))
+        self.softmax = Softmax(dim=-1)
+        self.numpath = 3
+        self.num_heads = 8
+        self.scale = (in_dim // self.num_heads) ** -0.5
+        self.qkv = nn.Linear(in_dim, in_dim * 3)
+        self.proj = nn.Linear(in_dim, in_dim)
+        crpe_window={3: 2, 5: 3, 7: 3}
+        # self.crpe = shared_crpe
+        self.crpe = ConvRelPosEnc(Ch=in_dim // self.num_heads, h=self.num_heads, window=crpe_window)
+
+    def forward(self, x):
+        B, C, numpath, height, width = x.size()
+        x1 = x.reshape(B,C,-1).permute(0,2,1)
+        B,N,C = x1.size()
+        # print(f'B:{B} N:{N} C:{C}')
+        qkv = (
+            self.qkv(x1)
+            .reshape(B, N, 3, self.num_heads, C // self.num_heads)
+            .permute(2, 0, 3, 1, 4)
+            .contiguous()
+        ) 
+        q, k, v = qkv[0], qkv[1], qkv[2]  # Shape: [B, h, N, Ch].
+        # print(f'shape q: {q.shape}')
+        # Factorized attention.
+        k_softmax = k.softmax(dim=2)  # Softmax on dim N.
+        k_softmax_T_dot_v = einsum(
+            "b h n k, b h n v -> b h k v", k_softmax, v
+        )  # Shape: [B, h, Ch, Ch].
+        factor_att = einsum(
+            "b h n k, b h k v -> b h n v", q, k_softmax_T_dot_v
+        )  # Shape: [B, h, N, Ch].
+        # print(f'attention: {factor_att.shape}')
+        # Convolutional relative position encoding.
+        # size=(height, width)
+        # crpe = self.crpe(q, v, size=size)  # Shape: [B, h, N, Ch].
+        # Merge and reshape.
+        # out = self.scale * factor_att + crpe
+        out = self.scale * factor_att 
+        out = (
+            out.transpose(1, 2).reshape(B, N, C).contiguous()
+        )  # Shape: [B, h, N, Ch] -> [B, N, h, Ch] -> [B, N, C].
+
+        # Output projection.
+        out = self.proj(out) #[B, N, C]
+        out = out.permute(0,2,1).reshape(B,C,numpath,height, width)#[B,C,N]
+        # print(f'out shape: {out.shape}')
+        gamma = self.gamma.to(out.device)
+        out = gamma * out + x
+        return out
+
+
+class SE_Block(nn.Module):
+    def __init__(self, in_ch, out_ch, r=16):
+        super().__init__()
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(in_ch, in_ch // r, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_ch // r, in_ch, bias=False),
+            nn.Sigmoid()
+        )
+        self.conv = torch.nn.Conv2d(in_ch, out_ch, kernel_size = (1,1))
+        self.act  = torch.nn.ReLU()
+        self.bn = nn.BatchNorm2d(out_ch)
+
+    def forward(self, x):
+        # print('start using se block')
+        bs, c, _, _ = x.shape
+        y = self.squeeze(x).view(bs, c)
+        y = self.excitation(y).view(bs, c, 1, 1)
+        x = x * y.expand_as(x)
+        x = self.conv(x)
+        x = self.act(self.bn(x))
+        
+        return x
+
+
+class Conv3d_BN_channel_attention_concat(nn.Module):
+    # input: attention list of length #path
+    def __init__(
+        self,
+        in_ch,
+        out_ch,
+        kernel_size=1,
+        stride=1,
+        pad=0,
+        dilation=1,
+        groups=1,
+        bn_weight_init=1,
+        act_layer=None,
+        norm_cfg="BN",
+        cam='cam'
+    ):
+        super().__init__()
+    
+        self.bn = nn.BatchNorm2d(out_ch)
+
+        torch.nn.init.constant_(self.bn.weight, bn_weight_init)
+        torch.nn.init.constant_(self.bn.bias, 0)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+       
+        self.interact_concat = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, kernel_size=(4,1,1)),
+            nn.GELU()
+        )
+        if cam == 'cam':
+            self.channelAttention = CAM_Module(in_dim = in_ch)
+            # print('cam chosen')
+        elif cam == 'cam_fact':
+            self.channelAttention = CAM_Factorized_Module(in_dim = in_ch)
+            # print('factorized module chosen')
+        else:
+            self.channelAttention = CAM_Factorized_Module(in_dim = in_ch)
+   
+
+        self.bn3d = nn.BatchNorm3d(in_ch)
+
+    def forward(self, x_list):
+        b,c,h,w = x_list[0].shape
+        # print(f"b:{b} c:{c} h:{h} w:{w}")
+     
+        out_3d = []
+        for ip in range(len(x_list)):
+#             print(f'ip:{ip}')
+            in_x = x_list[ip]  
+#             print(f'in each {ip} iteration: {in_x.shape}')
+            in_x = in_x.unsqueeze_(dim=2)
+            out_3d.append(in_x)
+#             print(f'{ip} path extend to shape: {in_x.shape}')
+
+            x = torch.cat(out_3d, dim=2)
+            x = self.bn3d(x)
+        
+
+        print(f'before channel attention: {x.shape}')
+        x = self.channelAttention(x)
+        x = self.bn3d(x)
+        # print(f'after channel: {x.shape}')
+        x = torch.squeeze(self.interact_concat(x), dim=2)
+        # print(f'after squeeze: {x.shape}')
+        x = self.bn(x)
+
+        return x
+
+
 
 class DWCPatchEmbed(nn.Module):
     """
@@ -531,7 +741,7 @@ class ConvPosEnc(nn.Module):
         B, N, C = x.shape
         H, W = size
 
-        feat = x.transpose(1, 2).contiguous().view(B, C, H, W)
+        feat = x.transpose(1, 2).contiguous().reshape(B, C, H, W)
         x = self.proj(feat) + feat
         x = x.flatten(2).transpose(1, 2).contiguous() #B C N->B N C
 
@@ -670,105 +880,6 @@ class FactorAtt_ConvRelPosEnc(nn.Module):
         x = self.proj_drop(x)
 
         return x
-
-# class Eff_FactorAtt_ConvRelPosEnc(nn.Module):
-#     """Factorized attention with convolutional relative position encoding class."""
-
-#     def __init__(
-#         self,
-#         dim,
-#         num_heads=8,
-#         qkv_bias=False,
-#         qk_scale=None,
-#         attn_drop=0.0,
-#         proj_drop=0.0,
-#         shared_crpe=None,
-#     ):
-#         super().__init__()
-#         self.num_heads = num_heads
-#         self.head_dim = dim // num_heads
-#         self.scale = qk_scale or self.head_dim ** -0.5
-
-#         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-#         self.attn_drop = nn.Dropout(attn_drop)  # Note: attn_drop is actually not used.
-#         self.proj = nn.Linear(dim, dim)
-#         self.proj_drop = nn.Dropout(proj_drop)
-#         self.reprojection = nn.Conv2d(dim, dim, 1)
-#         # Shared convolutional relative position encoding.
-#         self.crpe = shared_crpe
-
-#     def forward(self, x, size):
-
-#         # print('inside the Eff_FactorAtt')
-#         # EfficientAttention(in_channels=in_dim, key_channels=key_dim,value_channels=value_dim, head_count=1)
-#         B, N, C = x.shape
-#         H,W = size
-#         # x = Rearrange('b (h w) d -> b d h w', h=H, w=W)(x)
-#         qkv = self.qkv(x).reshape(B,N,3,C).permute(2,0,3,1) #B,N,3C->B,N,3,C->3,B,C,N
-#         q, k, v = qkv[0], qkv[1], qkv[2]
-
-#         head_key_channels = self.head_dim
-#         head_value_channels = self.head_dim
-
-#         attended_values = []
-#         for i in range(self.num_heads):
-#             key = F.softmax(k[
-#                 :,
-#                 i * head_key_channels: (i + 1) * head_key_channels,
-#                 :
-#             ], dim=2)
-            
-#             query = F.softmax(q[
-#                 :,
-#                 i * head_key_channels: (i + 1) * head_key_channels,
-#                 :
-#             ], dim=1)
-                        
-#             value = v[
-#                 :,
-#                 i * head_value_channels: (i + 1) * head_value_channels,
-#                 :
-#             ]  
-
-#             context = key @ value.transpose(1, 2) # dk*dv
-#             attended_value = (context.transpose(1, 2) @ query).reshape(B, head_value_channels, H, W) # n*dv            
-#             attended_values.append(attended_value)
-
-#         aggregated_values = torch.cat(attended_values, dim=1)
-#         attention = self.reprojection(aggregated_values) #[B,C,H,W]
-#         attention = Rearrange('b d h w -> b (h w) d')(attention)
-#         # Generate Q, K, V.
-#         # qkv = (
-#         #     self.qkv(x)
-#         #     .reshape(B, N, 3, self.num_heads, C // self.num_heads)
-#         #     .permute(2, 0, 3, 1, 4)
-#         #     .contiguous()
-#         # )  # Shape: [3, B, h, N, Ch].
-#         # q, k, v = qkv[0], qkv[1], qkv[2]  # Shape: [B, h, N, Ch].
-# #-----------
-#         # # Factorized attention.
-#         # k_softmax = k.softmax(dim=2)  # Softmax on dim N.
-#         # k_softmax_T_dot_v = einsum(
-#         #     "b h n k, b h n v -> b h k v", k_softmax, v
-#         # )  # Shape: [B, h, Ch, Ch].
-#         # factor_att = einsum(
-#         #     "b h n k, b h k v -> b h n v", q, k_softmax_T_dot_v
-#         # )  # Shape: [B, h, N, Ch].
-
-#         # # Convolutional relative position encoding.
-#         # crpe = self.crpe(q, v, size=size)  # Shape: [B, h, N, Ch].
-
-#         # # Merge and reshape.
-#         # x = self.scale * factor_att + crpe
-#         # x = (
-#         #     x.transpose(1, 2).reshape(B, N, C).contiguous()
-#         # )  # Shape: [B, h, N, Ch] -> [B, N, h, Ch] -> [B, N, C].
-
-#         # # Output projection.
-#         # x = self.proj(x)
-#         # x = self.proj_drop(x)
-
-#         return attention
 
 
 class MixFFN_skip(nn.Module):
@@ -972,11 +1083,20 @@ class MHCA_stage(nn.Module):
                 act_layer=nn.Hardswish,
                 norm_cfg=norm_cfg,
             )
-        else:
+        elif self.concat == '3d':
             self.aggregate = Conv3d_BN_concat(
                 embed_dim,
                 out_embed_dim
             )
+        elif self.concat == 'se':
+            self.aggregate = SE_Block(in_ch = embed_dim*4, out_ch= out_embed_dim, r=16)
+        else:
+            self.aggregate = Conv3d_BN_channel_attention_concat(
+                embed_dim,
+                out_embed_dim,
+                cam=self.concat# cam or cam_fact
+            )
+
 
     def forward(self, inputs):
         # print(len(inputs))
@@ -998,7 +1118,7 @@ class MHCA_stage(nn.Module):
         # print(f'before cat: {att_outputs[0].shape}')
         # print(f'before cat: {att_outputs[1].shape}')
         # print(f'before cat: {att_outputs[2].shape}')
-        if self.concat == 'normal':
+        if self.concat == 'normal' or 'se':
             out = self.aggregate( torch.cat(att_outputs, dim=1))
         else:
             out = self.aggregate(att_outputs)
@@ -1153,6 +1273,7 @@ class MSViT(nn.Module):
         
        
         # # transformer encoder
+        self.cpe = ConvPosEnc(in_dim[0], k=3)
         self.block1 = nn.ModuleList([ 
             EfficientTransformerBlock(in_dim[0], key_dim[0], value_dim[0], head_count, token_mlp)
         for _ in range(layers[0])])
@@ -1200,6 +1321,9 @@ class MSViT(nn.Module):
         # stage conv stem
         # stage 1
         x, H, W = self.patch_embed1(x)
+        # print(f'stage1 after embedding: {x.shape}')
+        x = self.cpe(x, (H,W))
+        # print(f'stage1 after cpe: {x.shape}')
         for blk in self.block1:
             x = blk(x, H, W)
         x = self.norm1(x)
@@ -1228,169 +1352,246 @@ class MSViT(nn.Module):
 
         return outs
     
-
-# Try to add the bridge
-
-class Scale_reduce(nn.Module):
-    def __init__(self, dim, reduction_ratio):
-        super().__init__()
-        self.dim = dim
-        self.reduction_ratio = reduction_ratio
-        if(len(self.reduction_ratio)==4):
-            self.sr0 = nn.Conv2d(dim, dim, reduction_ratio[3], reduction_ratio[3])
-            self.sr1 = nn.Conv2d(dim*2, dim*2, reduction_ratio[2], reduction_ratio[2])
-            self.sr2 = nn.Conv2d(dim*5, dim*5, reduction_ratio[1], reduction_ratio[1])
-        
-        elif(len(self.reduction_ratio)==3):
-            self.sr0 = nn.Conv2d(dim*2, dim*2, reduction_ratio[2], reduction_ratio[2])
-            self.sr1 = nn.Conv2d(dim*5, dim*5, reduction_ratio[1], reduction_ratio[1])
-        
-        self.norm = nn.LayerNorm(dim)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, C = x.shape
-        if(len(self.reduction_ratio)==4):
-            tem0 = x[:,:3136,:].reshape(B, 56, 56, C).permute(0, 3, 1, 2) 
-            tem1 = x[:,3136:4704,:].reshape(B, 28, 28, C*2).permute(0, 3, 1, 2)
-            tem2 = x[:,4704:5684,:].reshape(B, 14, 14, C*5).permute(0, 3, 1, 2)
-            tem3 = x[:,5684:6076,:]
-
-            sr_0 = self.sr0(tem0).reshape(B, C, -1).permute(0, 2, 1)
-            sr_1 = self.sr1(tem1).reshape(B, C, -1).permute(0, 2, 1)
-            sr_2 = self.sr2(tem2).reshape(B, C, -1).permute(0, 2, 1)
-
-            reduce_out = self.norm(torch.cat([sr_0, sr_1, sr_2, tem3], -2))
-        
-        if(len(self.reduction_ratio)==3):
-            tem0 = x[:,:1568,:].reshape(B, 28, 28, C*2).permute(0, 3, 1, 2) 
-            tem1 = x[:,1568:2548,:].reshape(B, 14, 14, C*5).permute(0, 3, 1, 2)
-            tem2 = x[:,2548:2940,:]
-
-            sr_0 = self.sr0(tem0).reshape(B, C, -1).permute(0, 2, 1)
-            sr_1 = self.sr1(tem1).reshape(B, C, -1).permute(0, 2, 1)
-            
-            reduce_out = self.norm(torch.cat([sr_0, sr_1, tem2], -2))
-        
-        return reduce_out
-
-        
-
-
-
-class M_EfficientSelfAtten(nn.Module):
-    def __init__(self, dim, head, reduction_ratio):
-        super().__init__()
-        self.head = head
-        self.reduction_ratio = reduction_ratio # list[1  2  4  8]
-        self.scale = (dim // head) ** -0.5
-        self.q = nn.Linear(dim, dim, bias=True)
-        self.kv = nn.Linear(dim, dim*2, bias=True)
-        self.proj = nn.Linear(dim, dim)
-        
-        if reduction_ratio is not None:
-            self.scale_reduce = Scale_reduce(dim,reduction_ratio)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, C = x.shape
-        q = self.q(x).reshape(B, N, self.head, C // self.head).permute(0, 2, 1, 3)
-
-        if self.reduction_ratio is not None:
-            x = self.scale_reduce(x)
-            
-        kv = self.kv(x).reshape(B, -1, 2, self.head, C // self.head).permute(2, 0, 3, 1, 4)
-        k, v = kv[0], kv[1]
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn_score = attn.softmax(dim=-1)
-
-        x_atten = (attn_score @ v).transpose(1, 2).reshape(B, N, C)
-        out = self.proj(x_atten)
-
-
-        return out
-
-class BridgeLayer_4(nn.Module):
-    def __init__(self, dims, head, reduction_ratios):
+class MSViT_4Stages(nn.Module):
+    def __init__(self, image_size, in_dim, key_dim, value_dim, layers, head_count=1, dil_conv=1, token_mlp='mix_skip',MSViT_config=1, concat='normal'):
         super().__init__()
 
-        self.norm1 = nn.LayerNorm(dims)
-        self.attn = M_EfficientSelfAtten(dims, head, reduction_ratios)
-        self.norm2 = nn.LayerNorm(dims)
-        self.mixffn1 = MixFFN_skip(dims,dims*4)
-        self.mixffn2 = MixFFN_skip(dims*2,dims*8)
-        self.mixffn3 = MixFFN_skip(dims*5,dims*20)
-        self.mixffn4 = MixFFN_skip(dims*8,dims*32)
-        
-        
-    def forward(self, inputs):
-        B = inputs[0].shape[0]
-        C = 64
-        if (type(inputs) == list):
-            # print("-----1-----")
-            c1, c2, c3, c4 = inputs
-            B, C, _, _= c1.shape
-            c1f = c1.permute(0, 2, 3, 1).reshape(B, -1, C)  # 3136*64
-            c2f = c2.permute(0, 2, 3, 1).reshape(B, -1, C)  # 1568*64
-            c3f = c3.permute(0, 2, 3, 1).reshape(B, -1, C)  # 980*64
-            c4f = c4.permute(0, 2, 3, 1).reshape(B, -1, C)  # 392*64
+        self.Hs=[56, 28, 14, 7]
+        self.Ws=[56, 28, 14, 7]
+        patch_sizes = [7, 3, 3, 3]
+        strides = [4, 2, 2, 2]
+        padding_sizes = [3, 1, 1, 1]
+        # dil_conv = False #no dilation this version...
+        if dil_conv:  
+            dilation = 2 
+            patch_sizes1 = [7, 5, 5, 5]
+            patch_sizes2 = [0, 3, 3, 3]
+            patch_sizes3 = [0, 1, 1, 1]
+            dil_padding_sizes1 = [3, 0, 0, 0]    
+            dil_padding_sizes2 = [0, 0, 0, 0]
+            dil_padding_sizes3 = [0, 0, 0, 0]
             
-            # print(c1f.shape, c2f.shape, c3f.shape, c4f.shape)
-            inputs = torch.cat([c1f, c2f, c3f, c4f], -2)
         else:
-            B,_,C = inputs.shape 
+            dilation = 1
+            patch_sizes1 = [7, 3, 3, 3]
+            patch_sizes2 = [5, 1, 1, 1]
+            patch_sizes3 = [0, 5, 5, 5]
+            dil_padding_sizes1 = [3, 1, 1, 1]
+            dil_padding_sizes2 = [1, 0, 0, 0]
+            dil_padding_sizes3 = [1, 2, 2, 2]
 
-        tx1 = inputs + self.attn(self.norm1(inputs))
-        tx = self.norm2(tx1)
 
+        # 1 by 1 convolution to alter the dimension
+        self.conv1_1_s1 = nn.Conv2d(3*in_dim[0], in_dim[0], 1)
+        self.conv1_1_s2 = nn.Conv2d(3*in_dim[1], in_dim[1], 1)
+        self.conv1_1_s3 = nn.Conv2d(3*in_dim[2], in_dim[2], 1)
+        self.conv1_1_s4 = nn.Conv2d(3*in_dim[3], in_dim[3], 1)
 
-        tem1 = tx[:,:3136,:].reshape(B, -1, C) 
-        tem2 = tx[:,3136:4704,:].reshape(B, -1, C*2)
-        tem3 = tx[:,4704:5684,:].reshape(B, -1, C*5)
-        tem4 = tx[:,5684:6076,:].reshape(B, -1, C*8)
-
-        m1f = self.mixffn1(tem1, 56, 56).reshape(B, -1, C)
-        m2f = self.mixffn2(tem2, 28, 28).reshape(B, -1, C)
-        m3f = self.mixffn3(tem3, 14, 14).reshape(B, -1, C)
-        m4f = self.mixffn4(tem4, 7, 7).reshape(B, -1, C)
-
-        t1 = torch.cat([m1f, m2f, m3f, m4f], -2)
+        # -------------MSViT codes---------------------------------------------------
         
-        tx2 = tx1 + t1
+        # Patch embeddings.
+        if MSViT_config == 1:
+            num_path = [2,3,3,3]
+            num_layers = [1, 3,8,3]
+            num_heads = [8,8,8,8]
+        elif MSViT_config == 2:
+            num_path = [2,3,3,3]
+            num_layers = [1, 3,8,3]
+            num_heads = [8,8,8,8]
+        else: #config==2
+            num_path = [2,3,3,3]
+            num_layers = [1, 3,8,3]
+            num_heads = [8,8,8,8]
 
 
-        return tx2
+    
+        mlp_ratios = [4, 4, 4, 4] # what is mlp_ratios?
+        num_stages = 4
+        drop_path_rate=0.0
+        dpr = dpr_generator(drop_path_rate, num_layers, num_stages)
+
+        self.stem = nn.Sequential(
+            Conv2d_BN(
+                3,
+                in_dim[0] // 2,
+                kernel_size=3,
+                stride=2,
+                pad=1,
+                act_layer=nn.Hardswish,
+            ),
+            Conv2d_BN(
+                in_dim[0] // 2,
+                in_dim[0],
+                kernel_size=3,
+                stride=2,
+                pad=1,
+                act_layer=nn.Hardswish,
+            ),
+        )
+
+        self.patch_embed_stage1 = Patch_Embed_stage(
+                    in_dim[0],
+                    num_path=num_path[0],
+                    isPool=False,
+                    norm_cfg='BN',
+                )
+     
+        self.patch_embed_stage2 = Patch_Embed_stage(
+                    in_dim[0],
+                    num_path=num_path[1],
+                    isPool=True,
+                    norm_cfg='BN',
+                )
+
+        self.patch_embed_stage3 = Patch_Embed_stage(
+                    in_dim[1],
+                    num_path=num_path[2],
+                    isPool=True, 
+                    norm_cfg='BN',
+                )
+        # if idx == 0 else True
+        self.patch_embed_stage4 = Patch_Embed_stage(
+                    in_dim[2],
+                    num_path=num_path[3],
+                    isPool=True,
+                    norm_cfg='BN',
+                )
 
 
+        # Multi-Head Convolutional Self-Attention (MHCA)
+        self.mhca_stage1 = MHCA_stage(
+                    in_dim[0],
+                    in_dim[0],
+                    num_layers[0],
+                    num_heads[0],
+                    mlp_ratios[0],
+                    num_path[0],
+                    norm_cfg='BN',
+                    drop_path_list=dpr[0],
+                    concat=concat
+                )
 
-class BridegeBlock_4(nn.Module):
-    def __init__(self, dims, head, reduction_ratios):
-        super().__init__()
-        self.bridge_layer1 = BridgeLayer_4(dims, head, reduction_ratios)
-        self.bridge_layer2 = BridgeLayer_4(dims, head, reduction_ratios)
-        self.bridge_layer3 = BridgeLayer_4(dims, head, reduction_ratios)
-        self.bridge_layer4 = BridgeLayer_4(dims, head, reduction_ratios)
+        self.mhca_stage2 = MHCA_stage(
+                    in_dim[0],
+                    in_dim[1],
+                    num_layers[1],
+                    num_heads[1],
+                    mlp_ratios[1],
+                    num_path[1],
+                    norm_cfg='BN',
+                    drop_path_list=dpr[0],
+                    concat=concat
+                )
+
+        self.mhca_stage3 = MHCA_stage(
+                    in_dim[1],
+                    in_dim[2],
+                    num_layers[2],
+                    num_heads[2],
+                    mlp_ratios[2],
+                    num_path[2],
+                    norm_cfg='BN',
+                    drop_path_list=dpr[1],
+                    concat=concat
+                )
+
+        self.mhca_stage4 = MHCA_stage(
+                    in_dim[2],
+                    in_dim[3],
+                    num_layers[3],
+                    num_heads[3],
+                    mlp_ratios[3],
+                    num_path[3],
+                    norm_cfg='BN',
+                    drop_path_list=dpr[2],
+                    concat=concat
+                )
+
+        # patch_embed
+        # layers = [2, 2, 2, 2] dims = [64, 128, 320, 512]
+        # self.patch_embed1 = OverlapPatchEmbeddings(image_size, patch_sizes[0], strides[0], padding_sizes[0], 3, in_dim[0])
+        
+       
+        # # transformer encoder
+        self.cpe = ConvPosEnc(in_dim[0], k=3)
+        self.block1 = nn.ModuleList([ 
+            EfficientTransformerBlock(in_dim[0], key_dim[0], value_dim[0], head_count, token_mlp)
+        for _ in range(layers[0])])
+        self.norm1 = nn.LayerNorm(in_dim[0])
+
+        
+        
+    def init_weights(self, pretrained=None):
+        """Initialize the weights in backbone.
+
+        Args:
+            pretrained (str, optional): Path to pre-trained weights.
+                Defaults to None.
+        """
+
+        def _init_weights(m):
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+                # trunc_normal_(m.weight, std=0.02)
+                # if isinstance(m, nn.Linear) and m.bias is not None:
+                #     nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+                # nn.init.constant_(m.bias, 0)
+                # nn.init.constant_(m.weight, 1.0)
+            elif isinstance(m, nn.Conv2d):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+
+       
+            
+        if pretrained is None:
+            self.apply(_init_weights)
+        else:
+            raise TypeError("pretrained must be a str or None")
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        bridge1 = self.bridge_layer1(x)
-        bridge2 = self.bridge_layer2(bridge1)
-        bridge3 = self.bridge_layer3(bridge2)
-        bridge4 = self.bridge_layer4(bridge3)
-
-        B,_,C = bridge4.shape
+        B = x.shape[0]
         outs = []
+        # stage conv stem
+        # stage 1
+        x, H, W = self.patch_embed1(x)
+        # print(f'stage1 after embedding: {x.shape}')
+        x = self.cpe(x, (H,W))
+        # print(f'stage1 after cpe: {x.shape}')
+        for blk in self.block1:
+            x = blk(x, H, W)
+        x = self.norm1(x)
+        x = x.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        outs.append(x)
 
-        sk1 = bridge4[:,:3136,:].reshape(B, 56, 56, C).permute(0,3,1,2) 
-        sk2 = bridge4[:,3136:4704,:].reshape(B, 28, 28, C*2).permute(0,3,1,2) 
-        sk3 = bridge4[:,4704:5684,:].reshape(B, 14, 14, C*5).permute(0,3,1,2) 
-        sk4 = bridge4[:,5684:6076,:].reshape(B, 7, 7, C*8).permute(0,3,1,2) 
+      
 
-        outs.append(sk1)
-        outs.append(sk2)
-        outs.append(sk3)
-        outs.append(sk4)
+        # # stage 2
+        # print("-------EN: Stage 2------\n\n")
+        att_input = self.patch_embed_stage2(x)
+        x = self.mhca_stage2(att_input)
+        outs.append(x)
+
+        # # stage 3
+        # print("-------EN: Stage 3------\n\n")
+        att_input = self.patch_embed_stage3(x)
+        x = self.mhca_stage3(att_input)
+        outs.append(x)
+
+        # # stage 4
+        # print("-------EN: Stage 4------\n\n")
+        att_input = self.patch_embed_stage4(x)
+        x = self.mhca_stage4(att_input)
+        outs.append(x)
 
         return outs
-
+  
 
 class MSTransception(nn.Module):
     def __init__(self, num_classes=9, head_count=1, dil_conv=1, token_mlp_mode="mix_skip", MSViT_config=1, concat='normal'):#, inception="135"
@@ -1398,7 +1599,7 @@ class MSTransception(nn.Module):
     
         # Encoder
         dims, key_dim, value_dim, layers = [[64, 128, 320, 512], [64, 128, 320, 512], [64, 128, 320, 512], [2, 2, 2, 2]]        
-        self.backbone = MSViT(image_size=224, in_dim=dims, key_dim=key_dim, value_dim=value_dim, layers=layers,
+        self.backbone = MSViT_4Stages(image_size=224, in_dim=dims, key_dim=key_dim, value_dim=value_dim, layers=layers,
                             head_count=head_count, dil_conv=dil_conv, token_mlp=token_mlp_mode, MSViT_config=MSViT_config, concat=concat)
         # self.backbone = MiT_3inception_padding(image_size=224, in_dim=dims, key_dim=key_dim, value_dim=value_dim, layers=layers,
         #                     head_count=head_count, dil_conv=dil_conv, token_mlp=token_mlp_mode)
@@ -1431,7 +1632,7 @@ class MSTransception(nn.Module):
         b,c,_,_ = output_enc[3].shape
 
         #---------------Decoder-------------------------     
-        tmp_3 = self.decoder_3(output_enc[3].permute(0,2,3,1).view(b,-1,c))
+        tmp_3 = self.decoder_3(output_enc[3].permute(0,2,3,1).reshape(b,-1,c))
         tmp_2 = self.decoder_2(tmp_3, output_enc[2].permute(0,2,3,1))
         tmp_1 = self.decoder_1(tmp_2, output_enc[1].permute(0,2,3,1))
         tmp_0 = self.decoder_0(tmp_1, output_enc[0].permute(0,2,3,1))
@@ -1439,12 +1640,16 @@ class MSTransception(nn.Module):
         return tmp_0
     
 
-# if __name__ == "__main__":
-#     #call Transception_res
-#     model = MSTransception(num_classes=9, head_count=8, dil_conv = 1, token_mlp_mode="mix_skip",MSViT_config=2, concat='3d')
-#     tmp_0 = model(torch.rand(1, 3, 224, 224))
-#     # print(len(out_enc))
-#     print(tmp_0.shape)
-#     # print(out_enc[1].shape)
-#     # print(out_enc[2].shape)
-#     # print(out_enc[3].shape)
+if __name__ == "__main__":
+    #call Transception_res
+    # normal 3d cam cam_fact se
+    model = MSTransception(num_classes=9, head_count=8, dil_conv = 1, token_mlp_mode="mix_skip",MSViT_config=2, concat='se')
+    tmp_0 = model(torch.rand(1, 3, 224, 224))
+    
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # model = model.to(device)
+    # summary(model, (1, 3,224,224) )
+    # stat(model.to('cpu'), (3, 224, 224))
+
+    print(tmp_0.shape)
+  
