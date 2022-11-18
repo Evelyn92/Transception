@@ -72,7 +72,7 @@ def plot_result(dice, h, snapshot_path,args):
 def trainer_synapse(args, model, snapshot_path):
     grad_clipping = args.grad_clipping
     use_scheduler = args.use_scheduler
-    # accumulation_steps = 2
+    accumulation_steps = 2
     os.makedirs(os.path.join(snapshot_path, 'test'), exist_ok=True)
     test_save_path = os.path.join(snapshot_path, 'test')
 
@@ -124,13 +124,13 @@ def trainer_synapse(args, model, snapshot_path):
     dice_loss = DiceLoss(num_classes)
     optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
     if use_scheduler: 
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iterations, eta_min=4e-4,verbose=True)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iterations, eta_min=0.02,verbose=True)
    
     best_performance = 0.0
     iterator = tqdm(range(max_epoch), ncols=70)
     dice_=[]
     hd95_= []
-    
+
     for epoch_num in iterator:
         for i_batch, sampled_batch in enumerate(trainloader):
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
@@ -138,15 +138,21 @@ def trainer_synapse(args, model, snapshot_path):
             image_batch, label_batch = image_batch.cuda(), label_batch.squeeze(1).cuda()
             outputs = model(image_batch)
             # outputs = F.interpolate(outputs, size=label_batch.shape[1:], mode='bilinear', align_corners=False)
-            loss_ce = ce_loss(outputs, label_batch[:].long())
-            loss_dice = dice_loss(outputs, label_batch, softmax=True)
+           
+            #accu
+            loss_ce = ce_loss(outputs, label_batch[:].long())/accumulation_steps
+            loss_dice = dice_loss(outputs, label_batch, softmax=True)/accumulation_steps
             loss = 0.4 * loss_ce + 0.6 * loss_dice
-            # print("loss-----------", loss)
-            optimizer.zero_grad()
+            if i_batch == 0:
+                optimizer.zero_grad()
+            
             loss.backward()
             if grad_clipping:
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=5, norm_type=2)
-            optimizer.step()
+           #accu
+            if(((i_batch+1)%accumulation_steps)==0) or ((i_batch+1)==len(trainloader)):
+                optimizer.step()
+                optimizer.zero_grad()
 
             if use_scheduler:
                 scheduler.step()

@@ -9,6 +9,7 @@ from einops.layers.torch import Rearrange
 from torch.nn import functional as F
 from torch.nn import Module, Conv2d, Parameter, Softmax
 from torchvision import models
+from torch.nn import init
 from torchinfo import summary
 # from torchstat import stat
 
@@ -65,11 +66,14 @@ class MLP_FFN(nn.Module):
         self.fc1 = nn.Linear(c1, c2)
         self.act = nn.GELU()
         self.fc2 = nn.Linear(c2, c1)
+        self.dropout = nn.Dropout(0.1)
 
     def forward(self, x):
         x = self.fc1(x)
         x = self.act(x)
+        x = self.dropout(x)
         x = self.fc2(x)
+        x = self.dropout(x)
         return x
 
 
@@ -450,9 +454,9 @@ class Conv3d_BN_concat(nn.Module):
             # print(f'{ip} path extend to shape{x.shape}')
 
         x = torch.cat(out_3d, dim=2)
-        # print(f'after concat: {x.shape}')
+        print(f'after concat: {x.shape}')
         x = torch.squeeze(self.interact_concat(x), dim=2)
-        # print(f'after squeeze: {x.shape}')
+        print(f'after squeeze: {x.shape}')
         x = self.bn(x)
 
         return x
@@ -651,7 +655,7 @@ class Conv3d_BN_channel_attention_concat(nn.Module):
             x = self.bn3d(x)
         
 
-        print(f'before channel attention: {x.shape}')
+        # print(f'before channel attention: {x.shape}')
         x = self.channelAttention(x)
         x = self.bn3d(x)
         # print(f'after channel: {x.shape}')
@@ -982,7 +986,7 @@ class MHCAEncoder(nn.Module):
         # x' shape : [B, N, C]
         for layer in self.MHCA_layers:
             x = layer(x, (H, W))
-            # print("---MHCAEncoder---")
+          
 
         # return x's shape : [B, N, C] -> [B, C, H, W]
         x = x.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
@@ -1070,6 +1074,7 @@ class SK_Block(nn.Module):
 
 
     def forward(self, x):
+        # print("checking skn")
         # print(f"x[0].shape: {x[0].shape}")
         bs, c, h, w = x[0].size()
     
@@ -1103,6 +1108,227 @@ class SK_Block(nn.Module):
 
         
 
+
+def dpr_generator(drop_path_rate, num_layers, num_stages):
+    """
+    Generate drop path rate list following linear decay rule
+    """
+    dpr_list = [x.item() for x in torch.linspace(0, drop_path_rate, sum(num_layers))]
+    dpr = []
+    cur = 0
+    for i in range(num_stages):
+        dpr_per_stage = dpr_list[cur : cur + num_layers[i]]
+        dpr.append(dpr_per_stage)
+        cur += num_layers[i]
+
+    return dpr
+
+#cbam
+
+class ChannelAttention(nn.Module):
+    def __init__(self,channel,reduction=16):
+        super().__init__()
+        self.maxpool=nn.AdaptiveMaxPool2d(1)
+        self.avgpool=nn.AdaptiveAvgPool2d(1)
+        self.se=nn.Sequential(
+            nn.Conv2d(channel,channel//reduction,1,bias=False),
+            nn.ReLU(),
+            nn.Conv2d(channel//reduction,channel,1,bias=False)
+        )
+        self.sigmoid=nn.Sigmoid()
+    
+    def forward(self, x) :
+        max_result=self.maxpool(x)
+        avg_result=self.avgpool(x)
+        max_out=self.se(max_result)
+        avg_out=self.se(avg_result)
+        output=self.sigmoid(max_out+avg_out)
+        return output
+
+class SpatialAttention(nn.Module):
+    def __init__(self,kernel_size=7):
+        super().__init__()
+        self.conv=nn.Conv2d(2,1,kernel_size=kernel_size,stride=1, padding=kernel_size//2)
+        self.sigmoid=nn.Sigmoid()
+    
+    def forward(self, x) :
+        max_result,_=torch.max(x,dim=1,keepdim=True)
+#         print(f'shape of max_result: {max_result.shape}')
+        avg_result=torch.mean(x,dim=1,keepdim=True)
+#         print(f'shape of avg_result: {avg_result.shape}')
+        result=torch.cat([max_result,avg_result],1)
+#         print(f'shape of result: {result.shape}')
+        output=self.conv(result)
+#         print(f'shape after conv: {output.shape}')
+        output=self.sigmoid(output)
+
+        return output
+
+
+
+class CBAMBlock(nn.Module):
+
+    def __init__(self, channel=512,out_ch=512, use_sa=True, reduction=16,kernel_size=49):
+        super().__init__()
+        self.ca=ChannelAttention(channel=channel,reduction=reduction)
+        self.sa=SpatialAttention(kernel_size=kernel_size)
+        self.conv2d_bn_act = nn.Sequential(
+            nn.Conv2d(channel,out_ch,1,bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU()
+            
+        )
+        self.use_sa = use_sa
+
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                init.constant_(m.weight, 1)
+                init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # print('checking cbam')
+        b, c, _, _ = x.size()
+        residual=x
+#         print(f'shape of residual: {x.shape}')
+        out=x*self.ca(x)
+        # print(f'shape of out ca: {out.shape}')
+        if self.use_sa:
+            out=out*self.sa(out)
+            # print(f'shape of out sa: {out.shape}')
+        out_cat = out+residual
+        out_cat = self.conv2d_bn_act(out_cat)
+        
+        return out_cat
+
+class CBAMBlock_casa(nn.Module):
+
+    def __init__(self, channel=512,out_ch=512, use_sa=True, reduction=16,kernel_size=49, inter="res"):
+        super().__init__()
+        self.ca=ChannelAttention(channel=channel,reduction=reduction)
+        self.sa=SpatialAttention(kernel_size=kernel_size)
+        self.conv2d_bn_act = nn.Sequential(
+            nn.Conv2d(channel,out_ch,1,bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU()
+            
+        )
+        self.use_sa = use_sa
+        self.inter = inter
+
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                init.constant_(m.weight, 1)
+                init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # print('checking cbam')
+        # print(f"cama: len of x_input: {len(x)}")
+        residual = x[0]
+        # out_tr = torch.cat(x[1:], dim=1) #concat the outputs of transformer
+        out_cat = torch.cat(x, dim=1) 
+        b, c, _, _ = out_cat.size()
+     
+        # print(f'shape of residual: {residual.shape}')
+        # print(f'shape of out_tr: {out_cat.shape}')
+        out=out_cat*self.ca(out_cat)
+        # print(f'shape of out ca: {out.shape}')
+        if self.use_sa and self.inter == 'res':
+            out=out*self.sa(residual)
+            print("use res inter")
+        elif self.use_sa and self.inter == 'out':
+            out=out*self.sa(out)# I try to replace it with residual or out
+            print("use out inter")
+        else:
+            out=out
+            # print(f'shape of out sa: {out.shape}')
+        out_cat = out+out_cat
+        out_cat = self.conv2d_bn_act(out_cat)
+        
+        return out_cat
+
+## CoorAttention
+class h_sigmoid(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_sigmoid, self).__init__()
+        self.relu = nn.ReLU6(inplace=inplace) #min(max(0,x),6)
+
+    def forward(self, x):
+        return self.relu(x + 3) / 6
+
+class h_swish(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_swish, self).__init__()
+        self.sigmoid = h_sigmoid(inplace=inplace)
+
+    def forward(self, x):
+        return x * self.sigmoid(x)
+
+class CoordAtt(nn.Module):
+    def __init__(self, inp, oup, reduction=32):
+        super(CoordAtt, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, inp // reduction)
+
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = h_swish()
+        
+        self.conv_h = nn.Conv2d(mip, inp, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, inp, kernel_size=1, stride=1, padding=0)
+        
+        self.conv_in_out = nn.Conv2d(inp, oup, kernel_size=1, stride=1, padding=0)
+        
+
+    def forward(self, x):
+        # print("Using coord")
+        identity = x
+        
+        n,c,h,w = x.size()
+        x_h = self.pool_h(x)
+#         print(f"x_h:{x_h.shape}")
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+#         print(f"x_w:{x_w.shape}")
+
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+
+        y = self.bn1(y)
+        y = self.act(y) 
+
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+
+        out = identity * a_w * a_h
+        out = self.conv_in_out(out)
+
+        return out
+
 class MHCA_stage(nn.Module):
     def __init__(
         self,
@@ -1114,7 +1340,9 @@ class MHCA_stage(nn.Module):
         num_path=4,
         norm_cfg="BN",
         drop_path_list=[],
-        concat='normal'
+        concat='normal',
+        use_sa = True,
+        sa_ker = 7
     ):
         super().__init__()
         self.concat=concat
@@ -1151,6 +1379,102 @@ class MHCA_stage(nn.Module):
             self.aggregate = SE_Block(in_ch = embed_dim*(num_path+1), out_ch= out_embed_dim, r=16)
         elif self.concat == 'skn':
             self.aggregate = SK_Block(in_ch=embed_dim, out_ch=out_embed_dim, num_path=num_path+1,reduction=8)
+        elif self.concat == 'cbam':
+            self.aggregate = CBAMBlock(channel=embed_dim*(num_path+1),out_ch=out_embed_dim,use_sa=use_sa, reduction=16,kernel_size=sa_ker)
+        elif self.concat == 'coord':
+            self.aggregate = CoordAtt(inp=embed_dim*(num_path+1),oup=out_embed_dim,reduction=16)
+        else:
+            self.aggregate = Conv3d_BN_channel_attention_concat(
+                embed_dim,
+                out_embed_dim,
+                cam=self.concat# cam or cam_fact
+            )
+
+
+    def forward(self, inputs):
+        # print(len(inputs))
+        # print("---Res---")
+        att_outputs = [self.InvRes(inputs[0])]
+       
+        for x, encoder in zip(inputs, self.mhca_blks):
+            # [B, C, H, W] -> [B, N, C]
+            _, _, H, W = x.shape
+            # print(f'H:{H} W:{W}')
+            x = x.flatten(2).transpose(1, 2).contiguous()
+            # print('going to the encoder')
+            tmp = encoder(x, size=(H, W))
+            # print(f'\n---attention path{tmp.shape}--')
+            att_outputs.append(tmp)
+
+        # out_concat = torch.cat(att_outputs, dim=1)
+        # print(f'att_outputs: {len(att_outputs)}')
+        # print(f'before cat: {att_outputs[0].shape}')
+        # print(f'before cat: {att_outputs[2].shape}')
+        # print(self.concat)
+        if self.concat == 'normal' or self.concat == 'se' or self.concat == 'cbam' or self.concat == "coord":
+            out = self.aggregate( torch.cat(att_outputs, dim=1))
+            # print('this one?')
+        else:
+            # print('sent a listinto')
+            out = self.aggregate(att_outputs)
+
+        # print(f'\n after cat: {out.shape}')
+
+        return out
+
+class MHCA_stage_casa(nn.Module):
+    def __init__(
+        self,
+        embed_dim,
+        out_embed_dim,
+        num_layers=1,
+        num_heads=8,
+        mlp_ratio=3,
+        num_path=4,
+        norm_cfg="BN",
+        drop_path_list=[],
+        concat='normal',
+        use_sa = True,
+        sa_ker = 7,
+        inter = 'res'
+    ):
+        super().__init__()
+        self.concat=concat
+      
+        self.mhca_blks = nn.ModuleList(
+            [
+                MHCAEncoder(
+                    embed_dim,
+                    num_layers,
+                    num_heads,
+                    mlp_ratio,
+                    drop_path_list=drop_path_list,
+                )
+                for _ in range(num_path)
+            ]
+        )
+
+        self.InvRes = ResBlock(
+            in_features=embed_dim, out_features=embed_dim, norm_cfg=norm_cfg
+        )
+        if self.concat == 'normal':
+            self.aggregate = Conv2d_BN(
+                embed_dim * (num_path + 1),
+                out_embed_dim,
+                act_layer=nn.Hardswish,
+                norm_cfg=norm_cfg,
+            )
+        elif self.concat == '3d':
+            self.aggregate = Conv3d_BN_concat(
+                embed_dim,
+                out_embed_dim
+            )
+        elif self.concat == 'se':
+            self.aggregate = SE_Block(in_ch = embed_dim*(num_path+1), out_ch= out_embed_dim, r=16)
+        elif self.concat == 'skn':
+            self.aggregate = SK_Block(in_ch=embed_dim, out_ch=out_embed_dim, num_path=num_path+1,reduction=8)
+        elif self.concat == 'cbam':
+            self.aggregate = CBAMBlock_casa(channel=embed_dim*(num_path+1),out_ch=out_embed_dim,use_sa=use_sa, reduction=16,kernel_size=sa_ker, inter=inter)
         else:
             self.aggregate = Conv3d_BN_channel_attention_concat(
                 embed_dim,
@@ -1190,23 +1514,10 @@ class MHCA_stage(nn.Module):
 
         return out
 
-#Jia: change the num_stages here because the stages are 4 originally
-def dpr_generator(drop_path_rate, num_layers, num_stages):
-    """
-    Generate drop path rate list following linear decay rule
-    """
-    dpr_list = [x.item() for x in torch.linspace(0, drop_path_rate, sum(num_layers))]
-    dpr = []
-    cur = 0
-    for i in range(num_stages):
-        dpr_per_stage = dpr_list[cur : cur + num_layers[i]]
-        dpr.append(dpr_per_stage)
-        cur += num_layers[i]
-
-    return dpr
 
 class MSViT(nn.Module):
-    def __init__(self, image_size, in_dim, key_dim, value_dim, layers, head_count=1, dil_conv=1, token_mlp='mix_skip',MSViT_config=1, concat='normal'):
+    def __init__(self, image_size, in_dim, key_dim, value_dim, layers, head_count=1, dil_conv=1, token_mlp='mix_skip',MSViT_config=1, concat='normal', use_sa_list=[True, True, False],
+        sa_ker=7):
         super().__init__()
 
         self.Hs=[56, 28, 14, 7]
@@ -1251,21 +1562,13 @@ class MSViT(nn.Module):
             num_path = [3,3,3]
             num_layers = [3,8,3]
             num_heads = [8,8,8]
-        # elif MSViT_config == 3:
-        #     num_path = [3,3,3]
-        #     num_layers = [3,8,3]
-        #     num_heads = [4,4,4]
-        #     # print(f"MSViT_config: {MSViT_config}")
         else: #config==2
             num_path = [3,3,3]
             num_layers = [3,8,3]
             num_heads = [8,8,8]
 
 
-        # num_heads = [8,8,8]
-        # print(f"num_path {num_path}")
-        # print(f"\n num_layers {num_layers}")
-        # print(f"\n num_heads {num_heads}")
+
         mlp_ratios = [4,4,4] # what is mlp_ratios?
         num_stages = 3
         drop_path_rate=0.0
@@ -1303,7 +1606,10 @@ class MSViT(nn.Module):
                     num_path[0],
                     norm_cfg='BN',
                     drop_path_list=dpr[0],
-                    concat=concat
+                    concat=concat,
+                    use_sa = use_sa_list[0],
+                    sa_ker=sa_ker
+
                 )
 
         self.mhca_stage3 = MHCA_stage(
@@ -1315,7 +1621,9 @@ class MSViT(nn.Module):
                     num_path[1],
                     norm_cfg='BN',
                     drop_path_list=dpr[1],
-                    concat=concat
+                    concat=concat,
+                    use_sa = use_sa_list[1],
+                    sa_ker=sa_ker
                 )
 
         self.mhca_stage4 = MHCA_stage(
@@ -1327,7 +1635,9 @@ class MSViT(nn.Module):
                     num_path[2],
                     norm_cfg='BN',
                     drop_path_list=dpr[2],
-                    concat=concat
+                    concat=concat,
+                    use_sa = use_sa_list[2],
+                    sa_ker=sa_ker
                 )
 
         # patch_embed
@@ -1416,7 +1726,8 @@ class MSViT(nn.Module):
         return outs
     
 class MSViT_4Stages(nn.Module):
-    def __init__(self, image_size, in_dim, key_dim, value_dim, layers, head_count=1, dil_conv=1, token_mlp='mix_skip',MSViT_config=1, concat='normal'):
+        
+    def __init__(self, image_size, in_dim, key_dim, value_dim, layers, head_count=1, dil_conv=1, token_mlp='mix_skip',MSViT_config=1, concat='normal', use_sa_list=[True,True,True,False], sa_ker=7):
         super().__init__()
 
         self.Hs=[56, 28, 14, 7]
@@ -1532,7 +1843,9 @@ class MSViT_4Stages(nn.Module):
                     num_path[0],
                     norm_cfg='BN',
                     drop_path_list=dpr[0],
-                    concat=concat
+                    concat=concat,
+                    use_sa = use_sa_list[0],
+                    sa_ker=sa_ker
                 )
 
         self.mhca_stage2 = MHCA_stage(
@@ -1544,7 +1857,9 @@ class MSViT_4Stages(nn.Module):
                     num_path[1],
                     norm_cfg='BN',
                     drop_path_list=dpr[1],
-                    concat=concat
+                    concat=concat,
+                    use_sa = use_sa_list[1],
+                    sa_ker=sa_ker
                 )
 
         self.mhca_stage3 = MHCA_stage(
@@ -1556,7 +1871,9 @@ class MSViT_4Stages(nn.Module):
                     num_path[2],
                     norm_cfg='BN',
                     drop_path_list=dpr[2],
-                    concat=concat
+                    concat=concat,
+                    use_sa = use_sa_list[2],
+                    sa_ker=sa_ker
                 )
 
         self.mhca_stage4 = MHCA_stage(
@@ -1568,7 +1885,9 @@ class MSViT_4Stages(nn.Module):
                     num_path[3],
                     norm_cfg='BN',
                     drop_path_list=dpr[3],
-                    concat=concat
+                    concat=concat,
+                    use_sa = use_sa_list[3],
+                    sa_ker=sa_ker
                 )
 
         # patch_embed
@@ -1620,6 +1939,7 @@ class MSViT_4Stages(nn.Module):
 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # print("The 4 stages:")
         B = x.shape[0]
         outs = []
         # stage conv stem
@@ -1649,6 +1969,222 @@ class MSViT_4Stages(nn.Module):
         # # stage 4
         # print("-------EN: Stage 4------\n\n")
         att_input = self.patch_embed_stage4(x)
+        x = self.mhca_stage4(att_input)
+        outs.append(x)
+
+        return outs
+  
+class MSViT_casa(nn.Module):
+    def __init__(self, image_size, in_dim, key_dim, value_dim, layers, head_count=1, dil_conv=1, token_mlp='mix_skip',MSViT_config=1, concat='normal', use_sa_list=[True, True, False],
+        sa_ker=7, inter='res'):
+        super().__init__()
+
+        self.Hs=[56, 28, 14, 7]
+        self.Ws=[56, 28, 14, 7]
+        patch_sizes = [7, 3, 3, 3]
+        strides = [4, 2, 2, 2]
+        padding_sizes = [3, 1, 1, 1]
+        # dil_conv = False #no dilation this version...
+        if dil_conv:  
+            dilation = 2 
+            patch_sizes1 = [7, 5, 5, 5]
+            patch_sizes2 = [0, 3, 3, 3]
+            patch_sizes3 = [0, 1, 1, 1]
+            dil_padding_sizes1 = [3, 0, 0, 0]    
+            dil_padding_sizes2 = [0, 0, 0, 0]
+            dil_padding_sizes3 = [0, 0, 0, 0]
+            
+        else:
+            dilation = 1
+            patch_sizes1 = [7, 3, 3, 3]
+            patch_sizes2 = [5, 1, 1, 1]
+            patch_sizes3 = [0, 5, 5, 5]
+            dil_padding_sizes1 = [3, 1, 1, 1]
+            dil_padding_sizes2 = [1, 0, 0, 0]
+            dil_padding_sizes3 = [1, 2, 2, 2]
+
+
+        # 1 by 1 convolution to alter the dimension
+        self.conv1_1_s1 = nn.Conv2d(3*in_dim[0], in_dim[0], 1)
+        self.conv1_1_s2 = nn.Conv2d(3*in_dim[1], in_dim[1], 1)
+        self.conv1_1_s3 = nn.Conv2d(3*in_dim[2], in_dim[2], 1)
+        self.conv1_1_s4 = nn.Conv2d(3*in_dim[3], in_dim[3], 1)
+
+        # -------------MSViT codes---------------------------------------------------
+        # Patch embeddings.
+        if MSViT_config == 1:
+            num_path = [3,3,3]
+            # num_layers = [3,6,3]
+            num_layers = [3,8,3]
+            num_heads = [8,8,8]
+        elif MSViT_config == 2:
+            num_path = [3,3,3]
+            num_layers = [3,8,3]
+            num_heads = [8,8,8]
+        else: #config==2
+            num_path = [3,3,3]
+            num_layers = [3,8,3]
+            num_heads = [8,8,8]
+
+
+
+        mlp_ratios = [4,4,4] # what is mlp_ratios?
+        num_stages = 3
+        drop_path_rate=0.0
+        dpr = dpr_generator(drop_path_rate, num_layers, num_stages)
+     
+        self.patch_embed_stage2 = Patch_Embed_stage(
+                    in_dim[0],
+                    num_path=num_path[0],
+                    isPool=True,
+                    norm_cfg='BN',
+                )
+
+        self.patch_embed_stage3 = Patch_Embed_stage(
+                    in_dim[1],
+                    num_path=num_path[1],
+                    isPool=True, 
+                    norm_cfg='BN',
+                )
+        # if idx == 0 else True
+        self.patch_embed_stage4 = Patch_Embed_stage(
+                    in_dim[2],
+                    num_path=num_path[2],
+                    isPool=True,
+                    norm_cfg='BN',
+                )
+
+
+        # Multi-Head Convolutional Self-Attention (MHCA)
+        self.mhca_stage2 = MHCA_stage_casa(
+                    in_dim[0],
+                    in_dim[1],
+                    num_layers[0],
+                    num_heads[0],
+                    mlp_ratios[0],
+                    num_path[0],
+                    norm_cfg='BN',
+                    drop_path_list=dpr[0],
+                    concat=concat,
+                    use_sa = use_sa_list[0],
+                    sa_ker=sa_ker,
+                    inter = inter
+
+                )
+
+        self.mhca_stage3 = MHCA_stage_casa(
+                    in_dim[1],
+                    in_dim[2],
+                    num_layers[1],
+                    num_heads[1],
+                    mlp_ratios[1],
+                    num_path[1],
+                    norm_cfg='BN',
+                    drop_path_list=dpr[1],
+                    concat=concat,
+                    use_sa = use_sa_list[1],
+                    sa_ker=sa_ker,
+                    inter = inter
+                )
+
+        self.mhca_stage4 = MHCA_stage_casa(
+                    in_dim[2],
+                    in_dim[3],
+                    num_layers[2],
+                    num_heads[2],
+                    mlp_ratios[2],
+                    num_path[2],
+                    norm_cfg='BN',
+                    drop_path_list=dpr[2],
+                    concat=concat,
+                    use_sa = use_sa_list[2],
+                    sa_ker=sa_ker,
+                    inter = inter
+                )
+
+        # patch_embed
+        # layers = [2, 2, 2, 2] dims = [64, 128, 320, 512]
+        self.patch_embed1 = OverlapPatchEmbeddings(image_size, patch_sizes[0], strides[0], padding_sizes[0], 3, in_dim[0])
+        
+       
+        # # transformer encoder
+        self.cpe = ConvPosEnc(in_dim[0], k=3)
+        self.block1 = nn.ModuleList([ 
+            EfficientTransformerBlock(in_dim[0], key_dim[0], value_dim[0], head_count, token_mlp)
+        for _ in range(layers[0])])
+        self.norm1 = nn.LayerNorm(in_dim[0])
+
+        
+        
+    def init_weights(self, pretrained=None):
+        """Initialize the weights in backbone.
+
+        Args:
+            pretrained (str, optional): Path to pre-trained weights.
+                Defaults to None.
+        """
+
+        def _init_weights(m):
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+                # trunc_normal_(m.weight, std=0.02)
+                # if isinstance(m, nn.Linear) and m.bias is not None:
+                #     nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+                # nn.init.constant_(m.bias, 0)
+                # nn.init.constant_(m.weight, 1.0)
+            elif isinstance(m, nn.Conv2d):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+
+       
+            
+        if pretrained is None:
+            self.apply(_init_weights)
+        else:
+            raise TypeError("pretrained must be a str or None")
+
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        outs = []
+        # stage conv stem
+        # stage 1
+        x, H, W = self.patch_embed1(x)
+        # print(f'stage1 after embedding: {x.shape}')
+        # x = self.cpe(x, (H,W))
+        # print(f'stage1 after cpe: {x.shape}')
+        for blk in self.block1:
+            x = blk(x, H, W)
+        x = self.norm1(x)
+        x = x.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        outs.append(x)
+
+      
+
+        # # stage 2
+        # print("-------EN: Stage 2------\n\n")
+        att_input = self.patch_embed_stage2(x)
+        # print(len(att_input))
+        x = self.mhca_stage2(att_input)
+        outs.append(x)
+
+        # # stage 3
+        # print("-------EN: Stage 3------\n\n")
+        att_input = self.patch_embed_stage3(x)
+        # print(len(att_input))
+        x = self.mhca_stage3(att_input)
+        outs.append(x)
+
+        # # stage 4
+        # print("-------EN: Stage 4------\n\n")
+        att_input = self.patch_embed_stage4(x)
+        # print(len(att_input))
         x = self.mhca_stage4(att_input)
         outs.append(x)
 
@@ -1716,30 +2252,104 @@ class M_EfficientSelfAtten(nn.Module):
             self.scale_reduce = Scale_reduce(dim,reduction_ratio)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # print(f"\n input of EfficientSelfAtten:{x.shape}")
         B, N, C = x.shape
         q = self.q(x).reshape(B, N, self.head, C // self.head).permute(0, 2, 1, 3)
+        # print(f"Shape of q: {q.shape}")
 
         if self.reduction_ratio is not None:
             x = self.scale_reduce(x)
-            
+            # print(f"Shape of reduced x for k and v: {x.shape}")
+
         kv = self.kv(x).reshape(B, -1, 2, self.head, C // self.head).permute(2, 0, 3, 1, 4)
         k, v = kv[0], kv[1]
+        # print(f"Shape of k:{k.shape}; shape of v {v.shape}")
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
+        # print(f"Shape of attention matrix:{attn.shape}")
         attn_score = attn.softmax(dim=-1)
 
-        x_atten = (attn_score @ v).transpose(1, 2).reshape(B, N, C)
+        x_atten = (attn_score @ v).transpose(1, 2)
+        # print(f"Shape of attention result:{x_atten.shape}")
+        x_atten = x_atten.reshape(B, N, C)
         out = self.proj(x_atten)
+        # print(f'out of attention: {out.shape}')
 
 
         return out
 
-class BridgeLayer_4(nn.Module):
-    def __init__(self, dims, head, reduction_ratios):
+
+class M_EfficientChannelAtten(nn.Module):
+    def __init__(self, dim, head, reduction_ratio):
+        super().__init__()
+        self.head = head
+        self.reduction_ratio = reduction_ratio # list[1  2  4  8]
+        self.scale = (dim // head) ** -0.5
+        self.q = nn.Linear(dim, dim, bias=True)
+        self.k = nn.Linear(dim, dim, bias=True)
+        self.v = nn.Linear(dim, dim, bias=True)
+        self.proj = nn.Linear(dim, dim)
+        
+        if reduction_ratio is not None:
+            self.scale_reduce = Scale_reduce(dim,reduction_ratio)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # print(f"\n inside channel att")
+        B, N, C = x.shape
+        k = self.k(x).reshape((B, C, N))
+        q = self.q(x).reshape((B, C, N))
+        v = self.v(x).reshape((B, C, N))
+
+        # q = self.q(x).reshape(B, N, self.head, C // self.head).permute(0, 2, 1, 3)
+        head_k_ch = C // self.head
+        head_v_ch = C// self.head
+        
+        attended_values = []
+        for i in range(self.head):
+            key = F.softmax(k[
+                :,
+                i * head_k_ch: (i + 1) * head_k_ch,
+                :
+            ], dim=2)
+            
+            query = F.softmax(q[
+                :,
+                i * head_k_ch: (i + 1) * head_k_ch,
+                :
+            ], dim=1)
+                        
+            value = v[
+                :,
+                i * head_v_ch: (i + 1) * head_v_ch,
+                :
+            ]            
+            
+            context = key @ value.transpose(1, 2) # dk*dv
+            # print(f'context:{context.shape}')  
+            attended_value = (context.transpose(1, 2) @ query)
+            # print(f'attended_value:{attended_value.shape}')    
+            attended_value = attended_value.reshape(B, head_v_ch, N) # n*dv      
+            # print(f'reshaped attended_value:{attended_value.shape}')      
+            attended_values.append(attended_value)
+                
+        aggregated_values = torch.cat(attended_values, dim=1)
+        # print(f'aggregated_values: {aggregated_values.shape}')
+        out = self.proj(aggregated_values.permute((0,2,1)))
+        # print(f'out of attention: {out.shape}')
+
+        return out
+
+
+class BridgLayer_4(nn.Module):
+    def __init__(self, dims, head, reduction_ratios, ch_att):
         super().__init__()
 
         self.norm1 = nn.LayerNorm(dims)
-        self.attn = M_EfficientSelfAtten(dims, head, reduction_ratios)
+        if ch_att:
+            self.attn = M_EfficientChannelAtten(dims, head, reduction_ratios)
+        else:
+            self.attn = M_EfficientSelfAtten(dims, head, reduction_ratios)
+        
         self.norm2 = nn.LayerNorm(dims)
         self.mixffn1 = MixFFN_skip(dims,dims*4)
         self.mixffn2 = MixFFN_skip(dims*2,dims*8)
@@ -1787,16 +2397,17 @@ class BridgeLayer_4(nn.Module):
 
 
 
-class BridegeBlock_4(nn.Module):
-    def __init__(self, dims, head, reduction_ratios):
+class BridgeBlock_4(nn.Module):
+    def __init__(self, dims, head, reduction_ratios, br_ch_att_list):
         super().__init__()
-        self.bridge_layer1 = BridgeLayer_4(dims, head, reduction_ratios)
-        self.bridge_layer2 = BridgeLayer_4(dims, head, reduction_ratios)
-        self.bridge_layer3 = BridgeLayer_4(dims, head, reduction_ratios)
-        self.bridge_layer4 = BridgeLayer_4(dims, head, reduction_ratios)
+        
+        self.bridge_layer1 = BridgLayer_4(dims, head, reduction_ratios, br_ch_att_list[0])
+        self.bridge_layer2 = BridgLayer_4(dims, head, reduction_ratios, br_ch_att_list[1])
+        self.bridge_layer3 = BridgLayer_4(dims, head, reduction_ratios, br_ch_att_list[2])
+        self.bridge_layer4 = BridgLayer_4(dims, head, reduction_ratios, br_ch_att_list[3])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # print('Not into Bridge block.')
+        # print('Checking bridge')
         bridge1 = self.bridge_layer1(x)
         bridge2 = self.bridge_layer2(bridge1)
         bridge3 = self.bridge_layer3(bridge2)
@@ -1817,15 +2428,346 @@ class BridegeBlock_4(nn.Module):
 
         return outs
 
+class BridgLayer_para(nn.Module):
+    def __init__(self, dims, head, reduction_ratios, ch_att):
+        super().__init__()
+
+        self.norm1 = nn.LayerNorm(dims)
+        if ch_att:
+            self.attn = M_EfficientChannelAtten(dims, head, reduction_ratios)
+        else:
+            self.attn = M_EfficientSelfAtten(dims, head, reduction_ratios)
+        
+        self.norm2 = nn.LayerNorm(dims)
+        self.mixffn1 = MixFFN_skip(dims,dims*4)
+        self.mixffn2 = MixFFN_skip(dims*2,dims*8)
+        self.mixffn3 = MixFFN_skip(dims*5,dims*20)
+        self.mixffn4 = MixFFN_skip(dims*8,dims*32)
+        
+        
+    def forward(self, inputs):
+        B = inputs[0].shape[0]
+        C = 64
+        if (type(inputs) == list):
+            # print("-----1-----")
+            c1, c2, c3, c4 = inputs
+            B, C, _, _= c1.shape
+            c1f = c1.permute(0, 2, 3, 1).reshape(B, -1, C)  # 3136*64
+            c2f = c2.permute(0, 2, 3, 1).reshape(B, -1, C)  # 1568*64
+            c3f = c3.permute(0, 2, 3, 1).reshape(B, -1, C)  # 980*64
+            c4f = c4.permute(0, 2, 3, 1).reshape(B, -1, C)  # 392*64
+            
+            # print(c1f.shape, c2f.shape, c3f.shape, c4f.shape)
+            inputs = torch.cat([c1f, c2f, c3f, c4f], -2)
+        else:
+            B,_,C = inputs.shape 
+
+        tx1 = inputs + self.attn(self.norm1(inputs))
+        tx = self.norm2(tx1)
+
+
+        tem1 = tx[:,:3136,:].reshape(B, -1, C) 
+        tem2 = tx[:,3136:4704,:].reshape(B, -1, C*2)
+        tem3 = tx[:,4704:5684,:].reshape(B, -1, C*5)
+        tem4 = tx[:,5684:6076,:].reshape(B, -1, C*8)
+
+        m1f = self.mixffn1(tem1, 56, 56).reshape(B, -1, C)
+        m2f = self.mixffn2(tem2, 28, 28).reshape(B, -1, C)
+        m3f = self.mixffn3(tem3, 14, 14).reshape(B, -1, C)
+        m4f = self.mixffn4(tem4, 7, 7).reshape(B, -1, C)
+
+        t1 = torch.cat([m1f, m2f, m3f, m4f], -2)
+        
+        tx2 = tx1 + t1
+
+
+        return tx2
+
+
+class BridgeBlock_para(nn.Module):
+    def __init__(self, dims, head, reduction_ratios, br_ch_att_list):
+        super().__init__()
+        
+        self.bridge_layer1 = BridgLayer_para(dims, head, reduction_ratios, True)
+        self.bridge_layer2 = BridgLayer_para(dims, head, reduction_ratios, False)
+        self.bridge_layer3 = BridgLayer_para(dims, head, reduction_ratios, True)
+        self.bridge_layer4 = BridgLayer_para(dims, head, reduction_ratios, False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # print('Checking bridge')
+        bridge1 = self.bridge_layer1(x)
+        bridge2 = self.bridge_layer2(bridge1)
+        bridge3 = self.bridge_layer3(bridge2)
+        bridge4 = self.bridge_layer4(bridge3)
+
+        B,_,C = bridge4.shape
+        outs = []
+
+        sk1 = bridge4[:,:3136,:].reshape(B, 56, 56, C).permute(0,3,1,2) 
+        sk2 = bridge4[:,3136:4704,:].reshape(B, 28, 28, C*2).permute(0,3,1,2) 
+        sk3 = bridge4[:,4704:5684,:].reshape(B, 14, 14, C*5).permute(0,3,1,2) 
+        sk4 = bridge4[:,5684:6076,:].reshape(B, 7, 7, C*8).permute(0,3,1,2) 
+
+        outs.append(sk1)
+        outs.append(sk2)
+        outs.append(sk3)
+        outs.append(sk4)
+
+        return outs
+
+# ----New Bridge---------
+# Spatial Fuse module
+class MultiScaleAtten(nn.Module):
+    def __init__(self, dim):
+        super(MultiScaleAtten, self).__init__()
+        self.qkv_linear = nn.Linear(dim, dim * 3)
+        self.softmax = nn.Softmax(dim=-1)
+        self.proj = nn.Linear(dim, dim)
+        self.num_head = 8
+        self.scale = (dim // self.num_head)**0.5
+
+    def forward(self, x):
+        B, num_blocks, _, _, C = x.shape  # (B, num_blocks, num_blocks, N, C)
+        qkv = self.qkv_linear(x).reshape(B, num_blocks, num_blocks, -1, 3, self.num_head, C // self.num_head).permute(4, 0, 1, 2, 5, 3, 6).contiguous() # (3, B, num_block, num_block, head, N, C)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        atten = q @ k.transpose(-1, -2).contiguous()
+        atten = self.softmax(atten)
+        atten_value = (atten @ v).transpose(-2, -3).contiguous().reshape(B, num_blocks, num_blocks, -1, C)
+        atten_value = self.proj(atten_value)  # (B, num_block, num_block, N, C)
+        return atten_value
+
+
+class InterTransBlock(nn.Module):
+    def __init__(self, dim):
+        super(InterTransBlock, self).__init__()
+        self.SlayerNorm_1 = nn.LayerNorm(dim, eps=1e-6)
+        self.SlayerNorm_2 = nn.LayerNorm(dim, eps=1e-6)
+        self.Attention = MultiScaleAtten(dim)
+        self.mlp = MLP_FFN(dim,4*dim)
+
+    def forward(self, x):
+        h = x  # (B, N, H)
+        x = self.SlayerNorm_1(x)
+
+        x = self.Attention(x)  
+        x = h + x
+
+        h = x
+        x = self.SlayerNorm_2(x)
+
+        x = self.mlp(x)
+        x = h + x
+
+        return x
+
+
+class SpatialAwareTrans(nn.Module):
+    def __init__(self, dim=64, num_sp_layer=1):  # (224*64, 112*128, 56*256, 28*256, 14*512) dim = 256
+        super(SpatialAwareTrans, self).__init__()
+        self.win_size_list = [8,4,2,1]
+        self.channels = [64, 64*2, 64*5, 64*8]
+        self.dim = dim
+        self.depth = 4
+        self.fc1 = nn.Linear(self.channels[0],dim)
+        self.fc2 = nn.Linear(self.channels[1],dim)
+        self.fc3 = nn.Linear(self.channels[2],dim)
+        self.fc4 = nn.Linear(self.channels[3],dim)
+
+        self.fc1_back = nn.Linear(dim, self.channels[0])
+        self.fc2_back = nn.Linear(dim, self.channels[1])
+        self.fc3_back = nn.Linear(dim, self.channels[2])
+        self.fc4_back = nn.Linear(dim, self.channels[3])
+
+        self.fc_back = nn.ModuleList()
+        for i in range(self.depth):
+            self.fc_back.append(nn.Linear(self.dim, self.channels[i]))
+      
+        self.num = num_sp_layer # the number of layers
+    
+
+        self.group_attention = []
+        for i in range(self.num):
+            self.group_attention.append(InterTransBlock(dim))
+        self.group_attention = nn.Sequential(*self.group_attention)
+        self.split_list = [8 * 8, 4 * 4, 2 * 2, 1 * 1]
+
+    def forward(self, x):
+        # project channel dimension to 256
+        # print("Start spatial aware:------------")
+        # print(f"x_0:{x[0].shape}")
+        # print(f"x_1:{x[1].shape}")
+        # print(f"x_2:{x[2].shape}")
+        # print(f"x_3:{x[3].shape}")
+
+        # utilize linear to project from other channel number to 256(C)
+        x[0] = self.fc1(x[0].permute(0,2,3,1))
+        x[1] = self.fc2(x[1].permute(0,2,3,1))
+        x[2] = self.fc3(x[2].permute(0,2,3,1))
+        x[3] = self.fc4(x[3].permute(0,2,3,1))
+        # x = [self.fc_module[i](item.permute(0, 2, 3, 1)) for i, item in enumerate(x)]  # [(B, H, W, C)]
+        # Patch Matching
+        # print("-----------------")
+        for j, item in enumerate(x):
+            # print(f"#{j} shape: {item.shape}")
+            B, H, W, C = item.shape
+            win_size = self.win_size_list[j]
+            # print(f'window size: {win_size}')
+            item = item.reshape(B, H // win_size, win_size, W // win_size, win_size, C).permute(0, 1, 3, 2, 4, 5).contiguous()#([B,H/win,W/win, win,win,C])
+            # print(f'reshape first step:{item.shape}')
+            item = item.reshape(B, H // win_size, W // win_size, win_size * win_size, C).contiguous()#([B,H/win,W/win, win*win,C])
+            # print(f'reshape second step:{item.shape}')
+            x[j] = item
+        x = tuple(x)
+        x = torch.cat(x, dim=-2)  # (B, H // win, W // win, N, C)
+        # print(f"\n fuse the four level together:{x.shape}")
+        
+        # Scale fusion
+        for i in range(self.num):
+            # print("num of scale fusion")
+            x = self.group_attention[i](x)  # (B, H // win_size, W // win_size, win_size*win_size, C)
+
+        x = torch.split(x, self.split_list, dim=-2)
+        x = list(x)
+        # patch reversion
+        # print("-------reversion----------")
+        for j, item in enumerate(x):
+            B, num_blocks, _, N, C = item.shape
+            win_size = self.win_size_list[j]
+            item = item.reshape(B, num_blocks, num_blocks, win_size, win_size, C).permute(0, 1, 3, 2, 4, 5).contiguous().reshape(B, num_blocks*win_size, num_blocks*win_size, C)
+            item = self.fc_back[j](item).permute(0, 3, 1, 2).contiguous()
+            # print(f"#{j} shape: {item.shape}")
+            x[j] = item
+       
+        return x
+
+
+
+    
+class BridgeLayer_new(nn.Module):
+    def __init__(self, dims, head, reduction_ratios, num_sp):
+        super().__init__()
+        C = 64
+        
+        self.norm1 = nn.LayerNorm(dims)
+        self.attn = M_EfficientSelfAtten(dims, head, reduction_ratios)
+        self.norm2 = nn.LayerNorm(dims)
+        self.mixffn1 = MixFFN_skip(dims,dims*4)
+        self.mixffn2 = MixFFN_skip(dims*2,dims*8)
+        self.mixffn3 = MixFFN_skip(dims*5,dims*20)
+        self.mixffn4 = MixFFN_skip(dims*8,dims*32)
+        
+        self.num = num_sp
+        self.scale_fuse_att = SpatialAwareTrans(dim=dims, num_sp_layer=num_sp)
+        
+    def forward(self, inputs):
+        # print(f"num_sp:{self.num}")
+        B = inputs[0].shape[0]
+        C = 64
+        H = 56
+        W = 56
+        if (type(inputs) == list):
+            if self.num > 0:
+                inputs = self.scale_fuse_att(inputs)
+            c1, c2, c3, c4 = inputs
+            B, C, _, _= c1.shape
+            c1f = c1.permute(0, 2, 3, 1).reshape(B, -1, C)  # 3136*64
+            c2f = c2.permute(0, 2, 3, 1).reshape(B, -1, C)  # 1568*64
+            c3f = c3.permute(0, 2, 3, 1).reshape(B, -1, C)  # 980*64
+            c4f = c4.permute(0, 2, 3, 1).reshape(B, -1, C)  # 392*64
+            
+            # print(c1f.shape, c2f.shape, c3f.shape, c4f.shape)
+            inputs = torch.cat([c1f, c2f, c3f, c4f], -2)
+        else:
+            B,_,C = inputs.shape 
+
+        tx1 = inputs + self.attn(self.norm1(inputs))
+        tx = self.norm2(tx1)
+
+
+        tem1 = tx[:,:3136,:].reshape(B, -1, C) 
+        tem2 = tx[:,3136:4704,:].reshape(B, -1, C*2)
+        tem3 = tx[:,4704:5684,:].reshape(B, -1, C*5)
+        tem4 = tx[:,5684:6076,:].reshape(B, -1, C*8)
+
+        m1f = self.mixffn1(tem1, 56, 56).reshape(B, -1, C)
+        m2f = self.mixffn2(tem2, 28, 28).reshape(B, -1, C)
+        m3f = self.mixffn3(tem3, 14, 14).reshape(B, -1, C)
+        m4f = self.mixffn4(tem4, 7, 7).reshape(B, -1, C)
+
+        t1 = torch.cat([m1f, m2f, m3f, m4f], -2)
+        
+        tx2 = tx1 + t1
+
+
+        return tx2
+
+
+
+class BridgeBlock_sp(nn.Module):
+    def __init__(self, dims, head, reduction_ratios, num_sp):
+        super().__init__()
+    
+        self.bridge_layer1 = BridgeLayer_new(dims, head, reduction_ratios, num_sp)
+        self.bridge_layer2 = BridgeLayer_new(dims, head, reduction_ratios, num_sp)
+        self.bridge_layer3 = BridgeLayer_new(dims, head, reduction_ratios, num_sp)
+        self.bridge_layer4 = BridgeLayer_new(dims, head, reduction_ratios, num_sp)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # print('Checking bridge')
+        bridge1 = self.bridge_layer1(x)
+        bridge2 = self.bridge_layer2(bridge1)
+        bridge3 = self.bridge_layer3(bridge2)
+        bridge4 = self.bridge_layer4(bridge3)
+
+        B,_,C = bridge4.shape
+        outs = []
+
+        sk1 = bridge4[:,:3136,:].reshape(B, 56, 56, C).permute(0,3,1,2) 
+        sk2 = bridge4[:,3136:4704,:].reshape(B, 28, 28, C*2).permute(0,3,1,2) 
+        sk3 = bridge4[:,4704:5684,:].reshape(B, 14, 14, C*5).permute(0,3,1,2) 
+        sk4 = bridge4[:,5684:6076,:].reshape(B, 7, 7, C*8).permute(0,3,1,2) 
+
+        outs.append(sk1)
+        outs.append(sk2)
+        outs.append(sk3)
+        outs.append(sk4)
+
+        return outs
 
 class MSTransception(nn.Module):
-    def __init__(self, num_classes=9, head_count=1, dil_conv=1, token_mlp_mode="mix_skip", MSViT_config=1, concat='normal', have_bridge=False):#, inception="135"
+    def __init__(self, num_classes=9, head_count=1, dil_conv=1, token_mlp_mode="mix_skip", MSViT_config=1, concat='normal', have_bridge='new', use_sa_config = 1,
+        sa_ker = 7, Stage_3or4=3, inter='res', num_sp = 1, br_ch_att_list = [False, False, False, True]):#, inception="135"
         super().__init__()
     
         # Encoder
-        dims, key_dim, value_dim, layers = [[64, 128, 320, 512], [64, 128, 320, 512], [64, 128, 320, 512], [2, 2, 2, 2]]        
-        self.backbone = MSViT(image_size=224, in_dim=dims, key_dim=key_dim, value_dim=value_dim, layers=layers,
-                            head_count=head_count, dil_conv=dil_conv, token_mlp=token_mlp_mode, MSViT_config=MSViT_config, concat=concat)
+        dims, key_dim, value_dim, layers = [[64, 128, 320, 512], [64, 128, 320, 512], [64, 128, 320, 512], [2, 2, 2, 2]]      
+        if use_sa_config==1:
+            use_sa_list = [True, True, False]  
+        elif use_sa_config==2:
+            use_sa_list = [True, False, False]  
+        elif use_sa_config==3:
+            use_sa_list = [False, False, False] 
+        elif use_sa_config==4:
+            use_sa_list = [True, True, True]
+        else:
+            use_sa_list = [True, True, True, False]
+
+
+        if concat != "cbam" or Stage_3or4 == 4:
+            use_sa_list = [True, True, True, False]
+
+
+        if Stage_3or4 == 4:
+            self.backbone = MSViT_4Stages(image_size=224, in_dim=dims, key_dim=key_dim, value_dim=value_dim, layers=layers,
+                            head_count=head_count, dil_conv=dil_conv, token_mlp=token_mlp_mode, MSViT_config=MSViT_config, concat=concat, use_sa_list=use_sa_list, sa_ker=sa_ker)
+        elif Stage_3or4 == 3:
+            self.backbone = MSViT(image_size=224, in_dim=dims, key_dim=key_dim, value_dim=value_dim, layers=layers,
+                            head_count=head_count, dil_conv=dil_conv, token_mlp=token_mlp_mode, MSViT_config=MSViT_config, concat=concat, use_sa_list=use_sa_list, sa_ker=sa_ker)
+        else:
+            self.backbone = MSViT_casa(image_size=224, in_dim=dims, key_dim=key_dim, value_dim=value_dim, layers=layers,
+                            head_count=head_count, dil_conv=dil_conv, token_mlp=token_mlp_mode, MSViT_config=MSViT_config, 
+                            concat=concat, use_sa_list=use_sa_list, sa_ker=sa_ker, inter=inter)
+            
         # self.backbone = MiT_3inception_padding(image_size=224, in_dim=dims, key_dim=key_dim, value_dim=value_dim, layers=layers,
         #                     head_count=head_count, dil_conv=dil_conv, token_mlp=token_mlp_mode)
 
@@ -1834,8 +2776,16 @@ class MSTransception(nn.Module):
         # (4)MiT_3inception_3branches
         # Bridge
         self.reduction_ratios = [1, 2, 4, 8]
-        self.bridge = BridegeBlock_4(64, 1, self.reduction_ratios)
         self.have_bridge = have_bridge
+        if have_bridge == 'original':
+            self.bridge = BridgeBlock_4(64, 1, self.reduction_ratios, br_ch_att_list)
+        elif have_bridge == 'sp':
+            self.bridge = BridgeBlock_sp(64, 1, self.reduction_ratios, num_sp)
+        elif have_bridge == 'para':
+            self.bridge = BridgeBlock_para(64, 1, self.reduction_ratios, num_sp)
+        else:
+            self.bridge = BridgeBlock_4(64, 1, self.reduction_ratios)
+        
 
         # Decoder
         d_base_feat_size = 7 #16 for 512 input size, and 7 for 224
@@ -1857,16 +2807,20 @@ class MSTransception(nn.Module):
             x = x.repeat(1,3,1,1)
 
         output_enc = self.backbone(x)
+        # print(f"output_enc[0]:{output_enc[0].shape}")
+        # print(f"output_enc[1]:{output_enc[1].shape}")
+        # print(f"output_enc[2]:{output_enc[2].shape}")
+        # print(f"output_enc[3]:{output_enc[3].shape}")
         # return output_enc
 
         b,c,_,_ = output_enc[3].shape
         #---------------Bridge-----------------------
-        if self.have_bridge:
-            bridge = self.bridge(output_enc) #list
+        if self.have_bridge !="None":
+            bridge = self.bridge(output_enc) # list
             b,c,_,_ = bridge[3].shape
             output_enc = bridge
+   
         
-
         #---------------Decoder-------------------------     
         tmp_3 = self.decoder_3(output_enc[3].permute(0,2,3,1).reshape(b,-1,c))
         tmp_2 = self.decoder_2(tmp_3, output_enc[2].permute(0,2,3,1))
@@ -1880,13 +2834,17 @@ class MSTransception(nn.Module):
 # if __name__ == "__main__":
 #     #call Transception_res
 #     # normal 3d cam cam_fact se
-#     model = MSTransception(num_classes=9, head_count=8, dil_conv = 1, token_mlp_mode="mix_skip",MSViT_config=2, concat='se', have_bridge = True)
+#     # model = MSTransception(num_classes=9, head_count=8, dil_conv = 1, token_mlp_mode="mix_skip",MSViT_config=2, concat='coord', have_bridge = True, Stage_3or4=3)
+#     # model = MSTransception(num_classes=9, head_count=8, dil_conv = 1, token_mlp_mode="mix_skip",MSViT_config=2, concat='cbam', have_bridge = True, use_sa_config=1, sa_ker=7, Stage_3or4=3)
+#     # model = MSTransception(num_classes=9, head_count=8, dil_conv = 1, token_mlp_mode="mix_skip",MSViT_config=2, concat='normal', have_bridge = True, Stage_3or4=4)
+#     # model = MSTransception(num_classes=9, head_count=8, dil_conv = 1, token_mlp_mode="mix_skip",MSViT_config=2, concat='skn', have_bridge = True, Stage_3or4=4)
+#     model = MSTransception(num_classes=9, head_count=8, dil_conv = 1, token_mlp_mode="mix_skip",MSViT_config=2, concat='coord', have_bridge = 'original', Stage_3or4=3, br_ch_att_list = [False, True, False, False])
+    
 #     tmp_0 = model(torch.rand(1, 3, 224, 224))
     
-#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#     model = model.to(device)
-#     summary(model, (1, 3,224,224) )
-#     # stat(model.to('cpu'), (3, 224, 224))
-
+#     # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#     # model = model.to(device)
+#     # summary(model, (1, 3,224,224) )
+#     # # stat(model.to('cpu'), (3, 224, 224))
 #     print(tmp_0.shape)
   

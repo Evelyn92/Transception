@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 # from networks.segformer import *
 # For jupyter notebook below
-from EffSegformer import *
+from .EffSegformer import *
 # from yiwei_gitlab.EffFormer.networks.inception import *
 from typing import Tuple
 from einops import rearrange
@@ -303,9 +303,64 @@ class EfficientTransformerBlockFuse_res(nn.Module):
         mx = torch.cat(mx,1)
         return mx
     
+class SK_Block(nn.Module):
+    #input: list of len=num_path b c h w
+
+    def __init__(self, in_ch, out_ch, num_path=3,reduction=16,group=1,L=32):
+        super().__init__()
+    
+        self.d=max(L,in_ch//reduction)
+
+        self.fc=nn.Linear(in_ch,self.d)
+        
+        self.fcs=nn.ModuleList([])
+        for i in range(num_path):
+            self.fcs.append(nn.Linear(self.d,in_ch))
+        self.softmax=nn.Softmax(dim=0)
+        self.conv_bn_ac = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size = (1,1)),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(out_ch)
+            
+        )
+
+
+
+    def forward(self, x):
+        # print(f"x[0].shape: {x[0].shape}")
+        bs, c, h, w = x[0].size()
+        feats=torch.stack(x,0)#k,bs,channel,h,w
+        # print(f'feats.shape: {feats.shape}')
+
+        ### fuse
+        U=sum(x) #bs,c,h,w
+        # print(f'U.shape: {U.shape}')
+
+        ### reduction channel
+        S=U.mean(-1).mean(-1) #bs,c
+        Z=self.fc(S) #bs,d
+        # print(f'Z.shape: {Z.shape}')
+
+        ### calculate attention weight
+        weights=[]
+        for fc in self.fcs:
+            weight=fc(Z)
+            weights.append(weight.view(bs,c,1,1)) #bs,channel
+        attention_weights=torch.stack(weights,0)#k,bs,channel,1,1
+        # print(f'attention_weight: {attention_weights.shape}')
+        attention_weights=self.softmax(attention_weights)#k,bs,channel,1,1
+
+        ### fuse
+        V=(attention_weights*feats).sum(0)
+        out = self.conv_bn_ac(V)
+        # print(f'out: {out.shape}')
+        
+        return out
+
+    
 
 class MiT_3inception(nn.Module):
-    def __init__(self, image_size, in_dim, key_dim, value_dim, layers, head_count=1, dil_conv=1, token_mlp='mix_skip'):
+    def __init__(self, image_size, in_dim, key_dim, value_dim, layers, head_count=1, dil_conv=1, token_mlp='mix_skip', concat='original'):
         super().__init__()
 
         self.Hs=[56, 28, 14, 7]
@@ -378,11 +433,17 @@ class MiT_3inception(nn.Module):
             EfficientTransformerBlockFuse(in_dim[3], key_dim[3], value_dim[3], head_count, token_mlp)
         for _ in range(layers[3])])
         self.norm4 = nn.LayerNorm(in_dim[3])
+
+        self.concat = concat
+        self.sk_concat2 = SK_Block(in_dim[1], in_dim[1], num_path=2,reduction=16)
+        self.sk_concat3 = SK_Block(in_dim[2], in_dim[2], num_path=2,reduction=16)
+        self.sk_concat4 = SK_Block(in_dim[3], in_dim[3], num_path=2,reduction=16)
         
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
         outs = []
+        num_path = 2
 
         # stage 1
         x, H, W = self.patch_embed1(x)
@@ -413,9 +474,19 @@ class MiT_3inception(nn.Module):
         map_mx1 = map_mx1.permute(0,3,1,2)
         map_mx2 = map_mx2.permute(0,3,1,2)
         map_mx1 = F.interpolate(map_mx1,[self.Hs[1], self.Ws[1]])
-        cat_maps = torch.cat((map_mx1, map_mx2),1)
-        x = self.conv1_1_s2(cat_maps)
+        if self.concat == 'original':      
+            cat_maps = torch.cat((map_mx1, map_mx2),1)
+            x = self.conv1_1_s2(cat_maps)
+        else:
+            in_sk = []
+            in_sk.append(map_mx1)
+            in_sk.append(map_mx2)
+            x = self.sk_concat2(in_sk)
+           
         outs.append(x)
+
+
+            
 
         # stage 3
        
@@ -436,8 +507,15 @@ class MiT_3inception(nn.Module):
         map_mx1 = map_mx1.permute(0,3,1,2)
         map_mx2 = map_mx2.permute(0,3,1,2)
         map_mx1 = F.interpolate(map_mx1,[self.Hs[2], self.Ws[2]])
-        cat_maps = torch.cat((map_mx1, map_mx2),1)
-        x = self.conv1_1_s3(cat_maps)
+        if self.concat == 'original':      
+            cat_maps = torch.cat((map_mx1, map_mx2),1)
+            x = self.conv1_1_s3(cat_maps)
+        else:
+            in_sk = []
+            in_sk.append(map_mx1)
+            in_sk.append(map_mx2)
+            x = self.sk_concat3(in_sk)
+           
         outs.append(x)
 
         # stage 4
@@ -459,208 +537,16 @@ class MiT_3inception(nn.Module):
         map_mx1 = map_mx1.permute(0,3,1,2)
         map_mx2 = map_mx2.permute(0,3,1,2)
         map_mx1 = F.interpolate(map_mx1,[self.Hs[3], self.Ws[3]])
-        cat_maps = torch.cat((map_mx1, map_mx2),1)
-        x = self.conv1_1_s4(cat_maps)
-        outs.append(x)
-
-        return outs
-    
-class MiT_3_ResInception(nn.Module):
-    def __init__(self, image_size, in_dim, key_dim, value_dim, layers, head_count=1, dil_conv=1, token_mlp='mix_skip', inception="135"):
-        super().__init__()
-
-        self.Hs=[56, 28, 14, 7]
-        self.Ws=[56, 28, 14, 7]
-        patch_sizes = [7, 3, 3, 3]
-        strides = [4, 2, 2, 2]
-        padding_sizes = [3, 1, 1, 1]
-        if dil_conv:  
-            dilation = 2 
-           
-            patch_sizes1 = [7, 3, 3, 3]
-            dil_padding_sizes1 = [3, 2, 2, 2]    
-            patch_sizes2 = [1, 1, 1, 1]
-            dil_padding_sizes2 = [0, 0, 0, 0]
+        if self.concat == 'original':      
+            cat_maps = torch.cat((map_mx1, map_mx2),1)
+            x = self.conv1_1_s4(cat_maps)
         else:
-            dilation = 1
-            patch_sizes1 = [7, 3, 3, 3]
-            patch_sizes2 = [5, 1, 1, 1]
-            dil_padding_sizes1 = [3, 1, 1, 1]
-            # dil_padding_sizes2 = [3, 0, 0, 0]
-            dil_padding_sizes2 = [1, 0, 0, 0]
-
-
-        # 1 by 1 convolution to alter the dimension
-      
-        self.conv1_1_s1 = nn.Conv2d((len(inception)+1)*in_dim[0], in_dim[0], 1)
-        self.conv1_1_s2 = nn.Conv2d((len(inception)+1)*in_dim[1], in_dim[1], 1)
-        self.conv1_1_s3 = nn.Conv2d((len(inception)+1)*in_dim[2], in_dim[2], 1)
-        self.conv1_1_s4 = nn.Conv2d((len(inception)+1)*in_dim[3], in_dim[3], 1)
-
-        # patch_embed
-        # layers = [2, 2, 2, 2] dims = [64, 128, 320, 512]
-        self.patch_embed1 = OverlapPatchEmbeddings(image_size, patch_sizes[0], strides[0], padding_sizes[0], 3, in_dim[0])
-        
-        self.patch_embed2_1 = OverlapPatchEmbeddings_fuse(image_size//4, patch_sizes1[1], strides[1], dil_padding_sizes1[1],dilation, in_dim[0], in_dim[1])
-        # self.patch_embed2_2 = OverlapPatchEmbeddings_fuse(image_size//4, patch_sizes2[1], strides[1], dil_padding_sizes2[1],dilation, in_dim[0], in_dim[1])
-        
-        
-        self.patch_embed3_1 = OverlapPatchEmbeddings_fuse(image_size//8, patch_sizes1[2], strides[2], dil_padding_sizes1[2],dilation, in_dim[1], in_dim[2])
-        # self.patch_embed3_2 = OverlapPatchEmbeddings_fuse(image_size//8, patch_sizes2[2], strides[2], dil_padding_sizes2[2],dilation, in_dim[1], in_dim[2])
-
-        self.patch_embed4_1 = OverlapPatchEmbeddings_fuse(image_size//16, patch_sizes1[3], strides[3], dil_padding_sizes1[3],dilation, in_dim[2], in_dim[3])
-        # self.patch_embed4_2 = OverlapPatchEmbeddings_fuse(image_size//16, patch_sizes2[3], strides[3], dil_padding_sizes2[3],dilation, in_dim[2], in_dim[3])
-        
-        # inception branch
-        multiResBlock = {
-                        '15': MultiResBlock_15,
-                        '13': MultiResBlock_13,
-                        '1': MultiResBlock_1,
-                        '3': MultiResBlock_3,
-                        '5': MultiResBlock_5,
-                        }
-        
-       
-        self.resInception2_2 = multiResBlock[inception](in_dim[0],in_dim[1],branch=1,downsample=strides[1],alpha=1)
-        self.resInception3_2 = multiResBlock[inception](in_dim[1],in_dim[2],branch=1,downsample=strides[2],alpha=1)
-        self.resInception4_2 = multiResBlock[inception](in_dim[2],in_dim[3],branch=1,downsample=strides[3],alpha=1)
-        
-
-        # transformer encoder
-        self.block1 = nn.ModuleList([ 
-            EfficientTransformerBlock(in_dim[0], key_dim[0], value_dim[0], head_count, token_mlp)
-        for _ in range(layers[0])])
-        self.norm1 = nn.LayerNorm(in_dim[0])
-
-        self.block2 = nn.ModuleList([
-            EfficientTransformerBlockFuse_res(in_dim[1], key_dim[1], value_dim[1], head_count, token_mlp)
-        for _ in range(layers[1])])
-        self.norm2 = nn.LayerNorm(in_dim[1])
-
-        self.block3 = nn.ModuleList([
-            EfficientTransformerBlockFuse_res(in_dim[2], key_dim[2], value_dim[2], head_count, token_mlp)
-        for _ in range(layers[2])])
-        self.norm3 = nn.LayerNorm(in_dim[2])
-
-        self.block4 = nn.ModuleList([
-            EfficientTransformerBlockFuse_res(in_dim[3], key_dim[3], value_dim[3], head_count, token_mlp)
-        for _ in range(layers[3])])
-        self.norm4 = nn.LayerNorm(in_dim[3])
-        
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B = x.shape[0]
-        outs = []
-
-        # stage 1
-        x, H, W = self.patch_embed1(x)
-        for blk in self.block1:
-            x = blk(x, H, W)
-        x = self.norm1(x)
-        x = x.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+            in_sk = []
+            in_sk.append(map_mx1)
+            in_sk.append(map_mx2)
+            x = self.sk_concat4(in_sk)
+           
         outs.append(x)
-
-      
-
-        # merge 2
-        # print("-------EN: Stage 2------\n\n")
-        x1, H1, W1 = self.patch_embed2_1(x)
-        H2 = H1
-        W2 = W1
-        # print("\n S2: H1:{}, H2:{}".format(H1,H2))
-        _, nfx1_len, _ = x1.shape
-        x2 = self.resInception2_2(x)
-        _, nfx2_len, _ = x2.shape
-        # print("\n x2 shape:", x2.shape)
-        nfx_cat = torch.cat((x1,x2),1)
-
-        # stage 2
-
-        for blk in self.block2:
-            nfx_cat = blk(nfx_cat, nfx1_len, nfx2_len, H1, W1, H2, W2)
-        tx = self.norm2(nfx_cat)
-        # The mlp has been passed in blk, so next just split the sequence and 
-        # reshape to spatial dimension
-        b,tx_len,_ = tx.shape
-        # z_total = []
-        map_mx_total = []
-        for nz in range(int(tx_len/nfx1_len)):
-            z = tx[:, nz*nfx1_len:(nz+1)*nfx1_len, :]
-            # z_total.append(z)
-            # print( z.shape)
-            map_mx = z.reshape(b,H1,W1,-1)
-            map_mx = map_mx.permute(0,3,1,2)
-            # print( "\nmap_mx: ",map_mx.shape)
-            map_mx_total.append(map_mx)
-
-        cat_maps = torch.cat(map_mx_total,1)
-        x = self.conv1_1_s2(cat_maps)
-        outs.append(x)
-
-        
-       # merge 3
-        x1, H1, W1 = self.patch_embed3_1(x)
-        H2 = H1
-        W2 = W1
-        # print("\n S3: H1:{}, H2:{}".format(H1,H2))
-        _, nfx1_len, _ = x1.shape
-        x2 = self.resInception3_2(x)
-        _, nfx2_len, _ = x2.shape
-        nfx_cat = torch.cat((x1,x2),1)
-
-        # stage 3
-        for blk in self.block3:
-            nfx_cat = blk(nfx_cat, nfx1_len, nfx2_len, H1, W1, H2, W2)
-        tx = self.norm3(nfx_cat)
-
-        b,tx_len,_ = tx.shape
-        # z_total = []
-        map_mx_total = []
-        for nz in range(int(tx_len/nfx1_len)):
-            z = tx[:, nz*nfx1_len:(nz+1)*nfx1_len, :]
-            # z_total.append(z)
-            # print( z.shape)
-            map_mx = z.reshape(b,H1,W1,-1)
-            map_mx = map_mx.permute(0,3,1,2)
-            # print( "\nmap_mx: ",map_mx.shape)
-            map_mx_total.append(map_mx)
-
-        cat_maps = torch.cat(map_mx_total,1)
-        x = self.conv1_1_s3(cat_maps)
-        outs.append(x)
-
-
-        # merge 4
-      
-        x1, H1, W1 = self.patch_embed4_1(x)
-        H2 = H1
-        W2 = W1
-        # print("\n S4: H1:{}, H2:{}".format(H1,H2))
-        _, nfx1_len, _ = x1.shape
-        x2 = self.resInception4_2(x)
-        _, nfx2_len, _ = x2.shape
-        nfx_cat = torch.cat((x1,x2),1)
-
-        # stage 4
-        for blk in self.block4:
-            nfx_cat = blk(nfx_cat, nfx1_len, nfx2_len, H1, W1, H2, W2)
-        tx = self.norm4(nfx_cat)
-        b,tx_len,_ = tx.shape
-        # z_total = []
-        map_mx_total = []
-        for nz in range(int(tx_len/nfx1_len)):
-            z = tx[:, nz*nfx1_len:(nz+1)*nfx1_len, :]
-            # z_total.append(z)
-            # print( z.shape)
-            map_mx = z.reshape(b,H1,W1,-1)
-            map_mx = map_mx.permute(0,3,1,2)
-            # print( "\nmap_mx: ",map_mx.shape)
-            map_mx_total.append(map_mx)
-
-        cat_maps = torch.cat(map_mx_total,1)
-        x = self.conv1_1_s4(cat_maps)
-        outs.append(x)
-
 
         return outs
     
@@ -1122,15 +1008,15 @@ class MyDecoderLayer(nn.Module):
     
     
 class Transception(nn.Module):
-    def __init__(self, num_classes=9, head_count=1, dil_conv=1, token_mlp_mode="mix_skip"):#, inception="135"
+    def __init__(self, num_classes=9, head_count=1, dil_conv=1, token_mlp_mode="mix_skip", concat='original'):#, inception="135"
         super().__init__()
     
         # Encoder
         dims, key_dim, value_dim, layers = [[64, 128, 320, 512], [64, 128, 320, 512], [64, 128, 320, 512], [2, 2, 2, 2]]        
-        self.backbone = MiT_3inception_3branches(image_size=224, in_dim=dims, key_dim=key_dim, value_dim=value_dim, layers=layers,
-                            head_count=head_count, dil_conv=dil_conv, token_mlp=token_mlp_mode)
+        self.backbone = MiT_3inception(image_size=224, in_dim=dims, key_dim=key_dim, value_dim=value_dim, layers=layers,
+                            head_count=head_count, dil_conv=dil_conv, token_mlp=token_mlp_mode, concat=concat)
         # self.backbone = MiT_3inception_padding(image_size=224, in_dim=dims, key_dim=key_dim, value_dim=value_dim, layers=layers,
-        #                     head_count=head_count, dil_conv=dil_conv, token_mlp=token_mlp_mode)
+        #                     head_count=head_count, dil_conv=dil_conv, token_mlp=token_mlp_mode, concat=concat)
 
         # Here options:(1) MiT_3inception->3 stages;(2) MiT->4 stages; 
         # (3)MiT_3inception_padding: padding before transformer after patch embedding (follow depthconcat)
@@ -1155,10 +1041,10 @@ class Transception(nn.Module):
             x = x.repeat(1,3,1,1)
 
         output_enc = self.backbone(x)
-        print('output_enc 0: {}'.format(output_enc[0].shape))
-        print('output_enc 1: {}'.format(output_enc[1].shape))
-        print('output_enc 2: {}'.format(output_enc[2].shape))
-        print('output_enc 3: {}'.format(output_enc[3].shape))
+        # print('output_enc 0: {}'.format(output_enc[0].shape))
+        # print('output_enc 1: {}'.format(output_enc[1].shape))
+        # print('output_enc 2: {}'.format(output_enc[2].shape))
+        # print('output_enc 3: {}'.format(output_enc[3].shape))
 
         b,c,_,_ = output_enc[3].shape
 
@@ -1170,9 +1056,9 @@ class Transception(nn.Module):
 
         return tmp_0
     
-if __name__ == "__main__":
-    #call Transception_res
-    model = Transception(num_classes=9, head_count=8, dil_conv = 1, token_mlp_mode="mix_skip")
+# if __name__ == "__main__":
+#     #call Transception_res
+#     model = Transception(num_classes=9, head_count=8, dil_conv = 1, token_mlp_mode="mix_skip", concat='sk')
 
-    print(model(torch.rand(1, 3, 224, 224)).shape)
+#     print(model(torch.rand(1, 3, 224, 224)).shape)
     

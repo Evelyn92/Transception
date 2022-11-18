@@ -1,12 +1,12 @@
-cmd = /home/students/yiwei/yiwei_gitlab/EffFormer/train.sh
+cmd = /home/students/yiwei/yiwei_gitlab/EffFormer/train_trans.sh
 
 # start directory
 initialdir = /home/students/yiwei/yiwei_gitlab/EffFormer
 
 # define output, error and log file 
-output = /work/scratch/yiwei/Transception_3branches_mha/log/model_$(cluster).$(Process)_out.log
-error = /work/scratch/yiwei/Transception_3branches_mha/log/model_$(cluster).$(Process)_err.log
-log = /work/scratch/yiwei/Transception_3branches_mha/log/model_$(cluster).$(Process)_log.log
+output = /work/scratch/yiwei/last_week/log/model_$(cluster).$(Process)_out.log
+error = /work/scratch/yiwei/last_week/log/model_$(cluster).$(Process)_err.log
+log = /work/scratch/yiwei/last_week/log/model_$(cluster).$(Process)_log.log
 
 # working environments
 getenv        = True
@@ -18,7 +18,7 @@ on_exit_hold = (ExitBySignal == True) || (ExitCode != 0)
 # Optional parameters
 ######################################################################
 
-JobBatchName = Transception_testMHA
+JobBatchName = MISSFormer_bl
 nice_user = False
 
 # Choose if job should run on cluster or workstation node. If unset job will run on eachy available node. Options are "cluster" or "workstations"
@@ -37,12 +37,12 @@ nice_user = False
 #
 # Attention: You can only set one requirement line. Add more requirements by using && e.g.
 #
-#requirements = (GPURAM > 4000) && POOL =="cluster"
-requirements = (GPURAM > 14000) && TARGET.Machine!="abatux.lfb.rwth-aachen.de"&& TARGET.Machine!="gauss.lfb.rwth-aachen.de" && TARGET.Machine!="pc81.lfb.rwth-aachen.de" && TARGET.Machine!="pc162.lfb.rwth-aachen.de" && TARGET.Machine!="pc167.lfb.rwth-aachen.de" && TARGET.Machine!="pc40.lfb.rwth-aachen.de" && TARGET.Machine!="pc44.lfb.rwth-aachen.de" && TARGET.Machine!="pc38.lfb.rwth-aachen.de" && TARGET.Machine!="pc61.lfb.rwth-aachen.de" && TARGET.Machine!="fermi.lfb.rwth-aachen.de" && TARGET.Machine!="pc63.lfb.rwth-aachen.de"
+requirements = (GPURAM > 12000) && TARGET.Machine == "edison.lfb.rwth-aachen.de" || TARGET.Machine == "pc176.lfb.rwth-aachen.de" || TARGET.Machine == "pc38.lfb.rwth-aachen.de" || TARGET.Machine == "pc40.lfb.rwth-aachen.de" || TARGET.Machine == "pc44.lfb.rwth-aachen.de" || TARGET.Machine == "pc57.lfb.rwth-aachen.de" || TARGET.Machine == "pc33.lfb.rwth-aachen.de"  || TARGET.Machine == "pc60.lfb.rwth-aachen.de"  || TARGET.Machine == "pc63.lfb.rwth-aachen.de" 
+#requirements = (GPURAM > 14000) && TARGET.Machine!="abatux.lfb.rwth-aachen.de"&& TARGET.Machine!="gauss.lfb.rwth-aachen.de" && TARGET.Machine!="pc81.lfb.rwth-aachen.de" && TARGET.Machine!="pc162.lfb.rwth-aachen.de" && TARGET.Machine!="pc167.lfb.rwth-aachen.de" && TARGET.Machine!="pc40.lfb.rwth-aachen.de" && TARGET.Machine!="pc44.lfb.rwth-aachen.de" && TARGET.Machine!="pc38.lfb.rwth-aachen.de" && TARGET.Machine!="pc61.lfb.rwth-aachen.de"
 
 
 # required number of CPU cores
-request_cpus = 1
+request_cpus = 0
 
 # required number of GPUs
 request_gpus = 1
@@ -52,7 +52,7 @@ request_memory = 20 GB
 
 # criterion after which to choose the machine
 # e.g. `rank = memory` takes machine with largest RAM
-# rank = memory
+rank = memory
 
 # number of seconds to wait before executing job
 # deferral_time = (CurrentTime + 1)
@@ -88,7 +88,5 @@ notification  = Never
 # --dataset Synapse --base_lr 0.05 --max_epochs 500 --eval_interval 20 --model_name Transception_3branches_head2 --batch_size 24 --root_path /images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/train_npz --dil_conv=1 --output_dir /work/scratch/yiwei/Transception_3branches_mha/head_count2 --head_count=2
 # --dataset Synapse --base_lr 0.05 --max_epochs 500 --eval_interval 20 --model_name Transception_3branches_head4 --batch_size 24 --root_path /images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/train_npz --dil_conv=1 --output_dir /work/scratch/yiwei/Transception_3branches_mha/head_count4 --head_count=4
 queue 1 args from (    
-   --dataset Synapse --base_lr 0.05 --max_epochs 500 --eval_interval 20 --model_name Transception_3branches_head2 --batch_size 24 --root_path /images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/train_npz --dil_conv=1 --output_dir /work/scratch/yiwei/Transception_3branches_mha/head_count2 --head_count=2
-   --dataset Synapse --base_lr 0.05 --max_epochs 500 --eval_interval 20 --model_name Transception_3branches_head4 --batch_size 24 --root_path /images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/train_npz --dil_conv=1 --output_dir /work/scratch/yiwei/Transception_3branches_mha/head_count4 --head_count=4
-   --dataset Synapse --base_lr 0.05 --max_epochs 500 --eval_interval 20 --model_name Transception_3branches_head8 --batch_size 24 --root_path /images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/train_npz --dil_conv=1 --output_dir /work/scratch/yiwei/Transception_3branches_mha/head_count8 --head_count=8
+   --dataset Synapse --base_lr 0.05 --max_epochs 400 --eval_interval 10 --if_bridge False --model_name MISSFormer_wo_br --batch_size 16 --root_path /images/PublicDataset/Transunet_synaps/project_TransUNet/data/Synapse/train_npz --output_dir /work/scratch/yiwei/last_week/MISSFormer_wo_br 
 )

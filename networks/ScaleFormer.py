@@ -365,6 +365,7 @@ class InterTransBlock(nn.Module):
         self.FFN = MLP(dim)
 
     def forward(self, x):
+        print("inter transblock try")
         h = x  # (B, N, H)
         x = self.SlayerNorm_1(x)
 
